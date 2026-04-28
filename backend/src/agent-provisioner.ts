@@ -15,6 +15,23 @@ const DEFAULT_AGENTS_MD = `# Agent Instructions
 - 保持角色一致性
 `;
 
+const CLAWUI_IMAGE_GENERATION_CONFIG_KEY = '__clawui_image_generation_model_config';
+const IMAGE_GENERATION_BRIDGE_MODEL_NAME_SUFFIX = ' (Image Generation Bridge)';
+const IMAGE_GENERATION_BRIDGE_PROVIDER_IDS = ['openai', 'litellm'] as const;
+const NATIVE_IMAGE_GENERATION_PROVIDER_IDS = new Set([
+  'comfy',
+  'fal',
+  'google',
+  'litellm',
+  'minimax',
+  'minimax-portal',
+  'openai',
+  'openai-codex',
+  'openrouter',
+  'vydra',
+  'xai',
+]);
+
 export interface ProvisionOptions {
   agentId: string;
   workspaceDir?: string;
@@ -40,6 +57,32 @@ export interface AgentModelConfigSnapshot {
 }
 
 export interface GlobalModelConfigSnapshot {
+  primary: string | null;
+  fallbacks: string[];
+}
+
+export interface ImageGenerationModelConfigSnapshot {
+  primary: string | null;
+  fallbacks: string[];
+}
+
+export interface ImageGenerationEndpointModelSnapshot {
+  id: string;
+  endpointId: string;
+  modelName: string;
+  baseUrl: string;
+  apiKey: string;
+  api: string;
+  authHeader?: string;
+  headers?: Record<string, string>;
+}
+
+interface ModelRefParts {
+  endpointId: string;
+  modelName: string;
+}
+
+interface ImageGenerationRuntimeConfig {
   primary: string | null;
   fallbacks: string[];
 }
@@ -87,27 +130,85 @@ export class AgentProvisioner {
     fs.writeFileSync(uiModelsPath, JSON.stringify(uiModels, null, 2));
   }
 
+  private readUiImageGenerationModelConfigFrom(uiModels: Record<string, any>): ImageGenerationModelConfigSnapshot | null {
+    const raw = uiModels[CLAWUI_IMAGE_GENERATION_CONFIG_KEY];
+    if (!raw || typeof raw !== 'object') return null;
+
+    const primary = this.normalizeModelId(raw.primary);
+    const fallbacks = primary ? this.normalizeFallbackIds(raw.fallbacks) : [];
+    if (!primary && fallbacks.length === 0) return null;
+
+    return { primary, fallbacks };
+  }
+
+  private readUiImageGenerationModelConfig(): ImageGenerationModelConfigSnapshot | null {
+    return this.readUiImageGenerationModelConfigFrom(this.readUiModelsFile());
+  }
+
+  private writeUiImageGenerationModelConfig(primary: string | null, fallbacks: string[]): boolean {
+    const uiModels = this.readUiModelsFile();
+    const previous = JSON.stringify(this.readUiImageGenerationModelConfigFrom(uiModels));
+
+    if (!primary) {
+      delete uiModels[CLAWUI_IMAGE_GENERATION_CONFIG_KEY];
+    } else {
+      uiModels[CLAWUI_IMAGE_GENERATION_CONFIG_KEY] = {
+        primary,
+        fallbacks: this.normalizeFallbackIds(fallbacks),
+      };
+    }
+
+    const next = JSON.stringify(this.readUiImageGenerationModelConfigFrom(uiModels));
+    if (previous === next) {
+      return false;
+    }
+
+    this.writeUiModelsFile(uiModels);
+    return true;
+  }
+
+  private normalizeInputCapability(value: unknown): string | null {
+    if (typeof value !== 'string') return null;
+    const trimmed = value.trim();
+    if (!trimmed) return null;
+
+    const normalized = trimmed.toLowerCase().replace(/[-\s]+/g, '_');
+    if (normalized === 'image_generation' || normalized === 'image_generate' || normalized === 'image_output') {
+      return 'image_generation';
+    }
+
+    return trimmed;
+  }
+
   private normalizeInputCapabilities(input: unknown): string[] {
     if (!Array.isArray(input)) return [];
 
     const seen = new Set<string>();
     const normalized: string[] = [];
     for (const item of input) {
-      if (typeof item !== 'string') continue;
-      const trimmed = item.trim();
-      if (!trimmed || seen.has(trimmed)) continue;
-      seen.add(trimmed);
-      normalized.push(trimmed);
+      const capability = this.normalizeInputCapability(item);
+      if (!capability || seen.has(capability)) continue;
+      seen.add(capability);
+      normalized.push(capability);
     }
     return normalized;
   }
 
   private inferKnownModelInputCapabilities(modelId: string): string[] {
+    const fullModelId = modelId.trim().toLowerCase();
     const slashIdx = modelId.indexOf('/');
     const modelName = (slashIdx === -1 ? modelId : modelId.slice(slashIdx + 1)).trim().toLowerCase();
 
     if (modelName === 'gpt-5.4') {
       return ['text', 'image'];
+    }
+
+    if (
+      /(^|[-_.])(gpt[-_.]?image|dall[-_.]?e|imagen|flux|sdxl|stable[-_.]?diffusion|seedream|jimeng|image[-_.]?01|grok[-_.]?imagine)([-_.]|$)/i.test(modelName)
+      || /gemini.*image|image[-_.]?preview/i.test(modelName)
+      || (/comfy/i.test(fullModelId) && modelName === 'workflow')
+    ) {
+      return ['image_generation'];
     }
 
     return [];
@@ -192,6 +293,217 @@ export class AgentProvisioner {
     if (missing.length > 0) {
       throw new Error(`Unknown model id: ${missing.join(', ')}`);
     }
+  }
+
+  private modelSupportsImageGeneration(config: any, modelId: string): boolean {
+    const availableModel = this.readAvailableModels().find((model) => model.id === modelId);
+    if (availableModel?.input?.includes('image_generation')) {
+      return true;
+    }
+
+    const directInput = this.mergeKnownModelInputCapabilities(
+      modelId,
+      config?.agents?.defaults?.models?.[modelId]?.input,
+    );
+    return directInput.includes('image_generation');
+  }
+
+  private validateImageGenerationModelIds(config: any, ids: string[]): void {
+    this.validateModelIds(config, ids);
+    const unsupported = ids.filter((id) => !this.modelSupportsImageGeneration(config, id));
+    if (unsupported.length > 0) {
+      throw new Error(`Model does not support image generation: ${unsupported.join(', ')}`);
+    }
+  }
+
+  private splitModelRef(modelId: string): ModelRefParts | null {
+    const trimmed = modelId.trim();
+    const slashIndex = trimmed.indexOf('/');
+    if (slashIndex <= 0 || slashIndex >= trimmed.length - 1) {
+      return null;
+    }
+
+    return {
+      endpointId: trimmed.slice(0, slashIndex).trim(),
+      modelName: trimmed.slice(slashIndex + 1).trim(),
+    };
+  }
+
+  private isNativeImageGenerationProvider(endpointId: string): boolean {
+    return NATIVE_IMAGE_GENERATION_PROVIDER_IDS.has(endpointId.trim().toLowerCase());
+  }
+
+  private isImageGenerationBridgeProviderId(providerId: string): boolean {
+    return (IMAGE_GENERATION_BRIDGE_PROVIDER_IDS as readonly string[]).includes(providerId.trim().toLowerCase());
+  }
+
+  private isManagedImageGenerationBridgeProvider(providerId: string, providerConfig: any): boolean {
+    if (!this.isImageGenerationBridgeProviderId(providerId)) return false;
+    if (!providerConfig || typeof providerConfig !== 'object') return false;
+    const models = providerConfig.models;
+    return Array.isArray(models)
+      && models.length > 0
+      && models.every((model: any) => typeof model?.name === 'string' && model.name.endsWith(IMAGE_GENERATION_BRIDGE_MODEL_NAME_SUFFIX));
+  }
+
+  private pruneUnusedImageGenerationBridgeProviders(config: any, keepProviderIds: Set<string>): boolean {
+    const providers = config?.models?.providers;
+    if (!providers || typeof providers !== 'object') return false;
+
+    let changed = false;
+    for (const providerId of IMAGE_GENERATION_BRIDGE_PROVIDER_IDS) {
+      if (keepProviderIds.has(providerId)) continue;
+      if (!this.isManagedImageGenerationBridgeProvider(providerId, providers[providerId])) continue;
+      delete providers[providerId];
+      changed = true;
+    }
+    return changed;
+  }
+
+  private getImageGenerationBridgeModelName(modelName: string): string {
+    return modelName.trim();
+  }
+
+  private getEndpointProviderConfig(config: any, endpointId: string): any | null {
+    const providers = config?.models?.providers;
+    if (!providers || typeof providers !== 'object') return null;
+    const direct = providers[endpointId];
+    if (direct && typeof direct === 'object') return direct;
+
+    const normalized = endpointId.trim().toLowerCase();
+    const matched = Object.entries(providers).find(([id]) => id.trim().toLowerCase() === normalized);
+    const providerConfig = matched?.[1];
+    return providerConfig && typeof providerConfig === 'object' ? providerConfig : null;
+  }
+
+  private configureImageGenerationBridgeProvider(
+    config: any,
+    bridgeProviderId: string,
+    endpointId: string,
+    modelNames: string[],
+  ): boolean {
+    const sourceProvider = this.getEndpointProviderConfig(config, endpointId);
+    if (!sourceProvider) {
+      throw new Error(`Image generation endpoint not found: ${endpointId}`);
+    }
+
+    const baseUrl = typeof sourceProvider.baseUrl === 'string' ? sourceProvider.baseUrl.trim() : '';
+    if (!baseUrl) {
+      throw new Error(`Image generation endpoint "${endpointId}" is missing baseUrl`);
+    }
+
+    if (sourceProvider.apiKey === undefined || sourceProvider.apiKey === null || String(sourceProvider.apiKey).trim() === '') {
+      throw new Error(`Image generation endpoint "${endpointId}" is missing apiKey`);
+    }
+
+    if (!config.models) config.models = {};
+    if (!config.models.providers) config.models.providers = {};
+
+    const uniqueModelNames = Array.from(new Set(modelNames.map((name) => name.trim()).filter(Boolean)));
+    const nextProvider: Record<string, any> = {
+      api: 'openai-completions',
+      auth: 'api-key',
+      baseUrl,
+      apiKey: sourceProvider.apiKey,
+      models: uniqueModelNames.map((id) => ({
+        id,
+        name: `${id}${IMAGE_GENERATION_BRIDGE_MODEL_NAME_SUFFIX}`,
+        api: 'openai-completions',
+        reasoning: false,
+        input: ['text'],
+      })),
+    };
+
+    if (sourceProvider.request !== undefined) {
+      nextProvider.request = sourceProvider.request;
+    }
+    if (sourceProvider.headers !== undefined) {
+      nextProvider.headers = sourceProvider.headers;
+    }
+    if (sourceProvider.authHeader !== undefined) {
+      nextProvider.authHeader = sourceProvider.authHeader;
+    }
+
+    const previousSerialized = JSON.stringify(config.models.providers[bridgeProviderId] || null);
+    config.models.providers[bridgeProviderId] = nextProvider;
+    return previousSerialized !== JSON.stringify(nextProvider);
+  }
+
+  private buildImageGenerationRuntimeConfig(
+    config: any,
+    primary: string | null,
+    fallbacks: string[],
+  ): { runtime: ImageGenerationRuntimeConfig; bridgeChanged: boolean } {
+    if (!primary) {
+      return {
+        runtime: { primary: null, fallbacks: [] },
+        bridgeChanged: false,
+      };
+    }
+
+    const refs = [primary, ...fallbacks]
+      .map((id) => ({ id, parts: this.splitModelRef(id) }))
+      .filter((entry): entry is { id: string; parts: ModelRefParts } => entry.parts !== null);
+
+    const bridgeProviderByEndpoint = new Map<string, string>();
+    const bridgeModelNamesByProvider = new Map<string, string[]>();
+
+    const resolveBridgeProviderId = (endpointId: string): string | null => {
+      const existing = bridgeProviderByEndpoint.get(endpointId);
+      if (existing) return existing;
+
+      const bridgeProviderId = IMAGE_GENERATION_BRIDGE_PROVIDER_IDS[bridgeProviderByEndpoint.size];
+      if (!bridgeProviderId) return null;
+
+      bridgeProviderByEndpoint.set(endpointId, bridgeProviderId);
+      bridgeModelNamesByProvider.set(bridgeProviderId, []);
+      return bridgeProviderId;
+    };
+
+    const toRuntimeRef = (id: string): string | null => {
+      const parts = this.splitModelRef(id);
+      if (!parts) return id;
+      if (this.isNativeImageGenerationProvider(parts.endpointId)) return id;
+      const bridgeProviderId = resolveBridgeProviderId(parts.endpointId);
+      if (!bridgeProviderId) return null;
+
+      const bridgeModelName = this.getImageGenerationBridgeModelName(parts.modelName);
+      if (bridgeModelName) {
+        bridgeModelNamesByProvider.get(bridgeProviderId)?.push(bridgeModelName);
+        return `${bridgeProviderId}/${bridgeModelName}`;
+      }
+
+      return null;
+    };
+
+    const runtimePrimary = toRuntimeRef(primary);
+    const runtimeFallbacks = this.normalizeFallbackIds(
+      fallbacks
+        .map((id) => toRuntimeRef(id))
+        .filter((id): id is string => Boolean(id && id !== runtimePrimary)),
+    );
+
+    let bridgeChanged = false;
+    for (const [endpointId, bridgeProviderId] of bridgeProviderByEndpoint) {
+      bridgeChanged = this.configureImageGenerationBridgeProvider(
+        config,
+        bridgeProviderId,
+        endpointId,
+        bridgeModelNamesByProvider.get(bridgeProviderId) || [],
+      ) || bridgeChanged;
+    }
+    bridgeChanged = this.pruneUnusedImageGenerationBridgeProviders(
+      config,
+      new Set(bridgeProviderByEndpoint.values()),
+    ) || bridgeChanged;
+
+    return {
+      runtime: {
+        primary: runtimePrimary || null,
+        fallbacks: runtimeFallbacks,
+      },
+      bridgeChanged,
+    };
   }
 
   private readStoredModelValue(raw: any): { primary: string | null; hasFallbacks: boolean; fallbacks: string[] } {
@@ -301,6 +613,32 @@ export class AgentProvisioner {
       nextPrimary,
       nextFallbacks.length > 0 ? 'custom' : 'disabled',
       nextFallbacks
+    );
+  }
+
+  private pruneImageGenerationModel(config: any, deletedIds: Set<string>): void {
+    if (!config?.agents?.defaults || !Object.prototype.hasOwnProperty.call(config.agents.defaults, 'imageGenerationModel')) {
+      return;
+    }
+
+    const current = this.readStoredModelValue(config.agents.defaults.imageGenerationModel);
+    let nextPrimary = current.primary && deletedIds.has(current.primary) ? null : current.primary;
+    let nextFallbacks = current.fallbacks.filter((id) => !deletedIds.has(id));
+
+    if (!nextPrimary && nextFallbacks.length > 0) {
+      nextPrimary = nextFallbacks[0];
+      nextFallbacks = nextFallbacks.slice(1);
+    }
+
+    if (!nextPrimary && nextFallbacks.length === 0) {
+      delete config.agents.defaults.imageGenerationModel;
+      return;
+    }
+
+    config.agents.defaults.imageGenerationModel = this.buildStoredModelValue(
+      nextPrimary,
+      current.hasFallbacks || nextFallbacks.length > 0 ? (nextFallbacks.length > 0 ? 'custom' : 'disabled') : 'inherit',
+      nextFallbacks,
     );
   }
 
@@ -704,6 +1042,7 @@ export class AgentProvisioner {
       config.agents.defaults.model.primary = globalModelConfig.primary;
     }
     config.agents.defaults.model.fallbacks = globalModelConfig.fallbacks.filter((id) => id !== modelId);
+    this.pruneImageGenerationModel(config, new Set([modelId]));
 
     // 3. Fallback agents that were using this model (deleting their 'model' falls back to default)
     if (Array.isArray(config.agents.list)) {
@@ -808,6 +1147,10 @@ export class AgentProvisioner {
         }
         this.writeUiModelsFile(uiModels);
       } catch(e) { console.error('Failed to sync updated UI models:', e); }
+
+      if (!normalizedInput.includes('image_generation')) {
+        this.pruneImageGenerationModel(config, new Set([modelId]));
+      }
     }
 
     config.agents.defaults.models[modelId] = updated;
@@ -857,6 +1200,7 @@ export class AgentProvisioner {
       }
       config.agents.defaults.model.fallbacks = defaultModelConfig.fallbacks
         .filter((id: string) => !deletedSet.has(id));
+      this.pruneImageGenerationModel(config, deletedSet);
 
       // Fallback agents using any deleted model
       if (Array.isArray(config.agents.list)) {
@@ -891,12 +1235,14 @@ export class AgentProvisioner {
       const providers = config?.models?.providers;
       if (!providers || typeof providers !== 'object') return [];
 
-      return Object.entries(providers).map(([id, meta]: [string, any]) => ({
-        id,
-        baseUrl: meta?.baseUrl || '',
-        apiKey: meta?.apiKey || '',
-        api: meta?.api || 'openai-completions',
-      }));
+      return Object.entries(providers)
+        .filter(([id, meta]) => !this.isManagedImageGenerationBridgeProvider(id, meta))
+        .map(([id, meta]: [string, any]) => ({
+          id,
+          baseUrl: meta?.baseUrl || '',
+          apiKey: meta?.apiKey || '',
+          api: meta?.api || 'openai-completions',
+        }));
     } catch (err) {
       console.error('Failed to read endpoints from openclaw.json:', err);
       return [];
@@ -1068,6 +1414,145 @@ export class AgentProvisioner {
       primary: stored.primary,
       fallbacks: stored.fallbacks,
     };
+  }
+
+  readImageGenerationModelConfig(): ImageGenerationModelConfigSnapshot {
+    const config = this.readConfigFile();
+    if (!config) {
+      return { primary: null, fallbacks: [] };
+    }
+
+    const uiStored = this.readUiImageGenerationModelConfig();
+    if (uiStored?.primary) {
+      const configuredIds = this.getConfiguredModelIds(config);
+      if (configuredIds.size === 0 || configuredIds.has(uiStored.primary)) {
+        return {
+          primary: uiStored.primary,
+          fallbacks: configuredIds.size === 0
+            ? uiStored.fallbacks
+            : uiStored.fallbacks.filter((id) => configuredIds.has(id)),
+        };
+      }
+    }
+
+    const stored = this.readStoredModelValue(config?.agents?.defaults?.imageGenerationModel);
+    return {
+      primary: stored.primary,
+      fallbacks: stored.fallbacks,
+    };
+  }
+
+  readImageGenerationEndpointModel(modelId: string): ImageGenerationEndpointModelSnapshot | null {
+    const config = this.readConfigFile();
+    if (!config) return null;
+
+    const parts = this.splitModelRef(modelId);
+    if (!parts) return null;
+
+    const provider = this.getEndpointProviderConfig(config, parts.endpointId);
+    if (!provider) return null;
+
+    const baseUrl = typeof provider.baseUrl === 'string' ? provider.baseUrl.trim() : '';
+    const apiKey = provider.apiKey === undefined || provider.apiKey === null
+      ? ''
+      : String(provider.apiKey).trim();
+    if (!baseUrl || !apiKey) return null;
+
+    const headers: Record<string, string> = {};
+    if (provider.headers && typeof provider.headers === 'object' && !Array.isArray(provider.headers)) {
+      for (const [key, value] of Object.entries(provider.headers)) {
+        if (typeof key !== 'string' || !key.trim()) continue;
+        if (value === undefined || value === null) continue;
+        headers[key.trim()] = String(value);
+      }
+    }
+
+    const authHeader = typeof provider.authHeader === 'string' && provider.authHeader.trim()
+      ? provider.authHeader.trim()
+      : undefined;
+
+    return {
+      id: modelId,
+      endpointId: parts.endpointId,
+      modelName: parts.modelName,
+      baseUrl,
+      apiKey,
+      api: typeof provider.api === 'string' && provider.api.trim() ? provider.api.trim() : 'openai-completions',
+      authHeader,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
+    };
+  }
+
+  async updateImageGenerationModelConfig(primary: string | null, fallbacks: string[]): Promise<boolean> {
+    const config = this.readConfigFile();
+    if (!config) return false;
+
+    const normalizedPrimary = this.normalizeModelId(primary);
+    const normalizedFallbacks = normalizedPrimary ? this.normalizeFallbackIds(fallbacks) : [];
+    this.validateImageGenerationModelIds(config, [
+      ...(normalizedPrimary ? [normalizedPrimary] : []),
+      ...normalizedFallbacks,
+    ]);
+
+    if (!config.agents) config.agents = {};
+    if (!config.agents.defaults) config.agents.defaults = {};
+
+    const previousSerialized = JSON.stringify(this.readImageGenerationModelConfig());
+    const previousRuntimeSerialized = JSON.stringify(config.agents.defaults.imageGenerationModel ?? null);
+    const selectedModelIds = [
+      ...(normalizedPrimary ? [normalizedPrimary] : []),
+      ...normalizedFallbacks,
+    ];
+    const canUseNativeRuntime = selectedModelIds.length > 0 && selectedModelIds.every((id) => {
+      const parts = this.splitModelRef(id);
+      return !parts || this.isNativeImageGenerationProvider(parts.endpointId);
+    });
+
+    if (!normalizedPrimary && normalizedFallbacks.length === 0) {
+      delete config.agents.defaults.imageGenerationModel;
+      this.pruneUnusedImageGenerationBridgeProviders(config, new Set());
+    } else if (!canUseNativeRuntime) {
+      delete config.agents.defaults.imageGenerationModel;
+      this.pruneUnusedImageGenerationBridgeProviders(config, new Set());
+    } else {
+      const { runtime, bridgeChanged } = this.buildImageGenerationRuntimeConfig(
+        config,
+        normalizedPrimary,
+        normalizedFallbacks,
+      );
+
+      if (!runtime.primary) {
+        throw new Error('Failed to resolve image generation runtime model');
+      }
+
+      config.agents.defaults.imageGenerationModel = this.buildStoredModelValue(
+        runtime.primary,
+        runtime.fallbacks.length > 0 ? 'custom' : 'disabled',
+        runtime.fallbacks,
+      );
+
+      if (bridgeChanged) {
+        config.agents.defaults.imageGenerationModel = this.buildStoredModelValue(
+          runtime.primary,
+          runtime.fallbacks.length > 0 ? 'custom' : 'disabled',
+          runtime.fallbacks,
+        );
+      }
+    }
+
+    const uiChanged = this.writeUiImageGenerationModelConfig(normalizedPrimary, normalizedFallbacks);
+    const nextRuntimeSerialized = JSON.stringify(config.agents.defaults.imageGenerationModel ?? null);
+    const nextSerialized = JSON.stringify({
+      primary: normalizedPrimary,
+      fallbacks: normalizedFallbacks,
+    });
+
+    if (previousSerialized === nextSerialized && previousRuntimeSerialized === nextRuntimeSerialized && !uiChanged) {
+      return false;
+    }
+
+    this.writeConfigFile(config);
+    return true;
   }
 
   async updateGlobalFallbacks(fallbacks: string[]): Promise<boolean> {

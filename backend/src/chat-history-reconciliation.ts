@@ -183,10 +183,15 @@ export function extractSettledAssistantOutcomeRecord(historyPayload: any, baseli
       break;
     }
 
-    const outcome = getAssistantOutcomeRecord(message);
-    if (outcome.kind !== 'none') {
-      return outcome;
+    const normalizedMessage = normalizeOpenClawMessageRecord(message);
+    if (normalizedMessage?.role !== 'assistant') {
+      continue;
     }
+
+    // Only trust the newest assistant record after the run baseline.
+    // If it is still a tool-use/intermediate assistant message, wait for the
+    // terminal record instead of falling back to an older assistant reply.
+    return getAssistantOutcomeRecord(normalizedMessage);
   }
 
   return { kind: 'none', timestampMs: null };

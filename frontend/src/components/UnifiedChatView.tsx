@@ -2948,6 +2948,11 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                 } else if (evt.type === 'final') {
                   patch.processStreaming = false;
                 }
+                if (typeof evt.modelUsed === 'string') {
+                  patch.model = evt.modelUsed;
+                } else if (typeof evt.model_used === 'string') {
+                  patch.model = evt.model_used;
+                }
                 queueAssistantPatch(patch, evt.type === 'final');
               } else if (evt.type === 'error') {
                 receivedError = true;
@@ -3196,6 +3201,11 @@ export default function UnifiedChatView(props: UnifiedChatViewProps) {
                   patch.processStreaming = evt.process_streaming;
                 } else if (evt.type === 'final') {
                   patch.processStreaming = false;
+                }
+                if (typeof evt.modelUsed === 'string') {
+                  patch.model = evt.modelUsed;
+                } else if (typeof evt.model_used === 'string') {
+                  patch.model = evt.model_used;
                 }
                 queueAssistantPatch(patch, evt.type === 'final');
               } else if (evt.type === 'error') {

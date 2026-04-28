@@ -16,6 +16,7 @@ type ModelSinglePickerProps = {
   allModelsTabLabel: string;
   defaultBadgeLabel: string;
   visionBadgeLabel?: string;
+  imageGenerationBadgeLabel?: string;
   disabled?: boolean;
   className?: string;
 };
@@ -23,6 +24,10 @@ type ModelSinglePickerProps = {
 function getModelDisplayName(model?: ModelOption | null): string {
   if (!model) return '';
   return model.alias?.trim() || model.id;
+}
+
+function modelSupportsCapability(model: ModelOption, capability: string): boolean {
+  return (model.input || []).some((item) => item.toLowerCase().replace(/[-\s]+/g, '_') === capability);
 }
 
 export default function ModelSinglePicker({
@@ -34,6 +39,7 @@ export default function ModelSinglePicker({
   allModelsTabLabel,
   defaultBadgeLabel,
   visionBadgeLabel = '',
+  imageGenerationBadgeLabel = '',
   disabled = false,
   className = '',
 }: ModelSinglePickerProps) {
@@ -132,6 +138,11 @@ export default function ModelSinglePicker({
                       {visionBadgeLabel && model.input?.includes('image') ? (
                         <span className="rounded bg-green-100 px-1.5 py-0.5 text-[10px] font-medium text-green-600">
                           {visionBadgeLabel}
+                        </span>
+                      ) : null}
+                      {imageGenerationBadgeLabel && modelSupportsCapability(model, 'image_generation') ? (
+                        <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                          {imageGenerationBadgeLabel}
                         </span>
                       ) : null}
                     </div>

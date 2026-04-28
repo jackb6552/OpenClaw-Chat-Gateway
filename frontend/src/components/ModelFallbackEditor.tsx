@@ -35,6 +35,7 @@ type ModelFallbackEditorProps = {
   defaultBadgeLabel: string;
   allModelsTabLabel?: string;
   visionBadgeLabel?: string;
+  imageGenerationBadgeLabel?: string;
   selectionUiVariant?: 'grid' | 'model-picker';
   hideModeSelector?: boolean;
   className?: string;
@@ -52,6 +53,10 @@ function renderModelLabel(model: ModelOption) {
     primary: model.id,
     secondary: '',
   };
+}
+
+function modelSupportsCapability(model: ModelOption, capability: string): boolean {
+  return (model.input || []).some((item) => item.toLowerCase().replace(/[-\s]+/g, '_') === capability);
 }
 
 export default function ModelFallbackEditor({
@@ -78,6 +83,7 @@ export default function ModelFallbackEditor({
   defaultBadgeLabel,
   allModelsTabLabel = '',
   visionBadgeLabel = '',
+  imageGenerationBadgeLabel = '',
   selectionUiVariant = 'grid',
   hideModeSelector = false,
   className = '',
@@ -201,6 +207,11 @@ export default function ModelFallbackEditor({
                                   {visionBadgeLabel}
                                 </span>
                               ) : null}
+                              {imageGenerationBadgeLabel && modelSupportsCapability(model, 'image_generation') ? (
+                                <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                                  {imageGenerationBadgeLabel}
+                                </span>
+                              ) : null}
                             </div>
                           </button>
                         );
@@ -251,11 +262,18 @@ export default function ModelFallbackEditor({
                       <div className="truncate text-xs text-gray-500">{label.secondary}</div>
                     ) : null}
                   </div>
-                  {model.primary ? (
-                    <span className="shrink-0 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">
-                      {defaultBadgeLabel}
-                    </span>
-                  ) : null}
+                  <div className="flex shrink-0 items-center gap-2">
+                    {model.primary ? (
+                      <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700">
+                        {defaultBadgeLabel}
+                      </span>
+                    ) : null}
+                    {imageGenerationBadgeLabel && modelSupportsCapability(model, 'image_generation') ? (
+                      <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600">
+                        {imageGenerationBadgeLabel}
+                      </span>
+                    ) : null}
+                  </div>
                 </button>
               );
             })

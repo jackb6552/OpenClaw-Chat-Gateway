@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, Fragment, type ChangeEvent } from 'react';
-import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag, Activity, Globe, Zap, Wrench, ArrowUpDown, Link2, ChevronDown } from 'lucide-react';
+import { Eye, EyeOff, Check, X, Loader2, Edit2, Trash2, Plus, Menu, Github, Send, ShoppingBag, Activity, Globe, Zap, Wrench, ArrowUpDown, Link2, ChevronDown, Image as ImageIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { SettingsTab } from '../App';
 import { applyLanguagePreference, normalizeLanguage, type SupportedLanguage } from '../i18n';
@@ -731,6 +731,11 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [defaultModelId, setDefaultModelId] = useState('');
   const [defaultModelError, setDefaultModelError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isSavingDefaultModel, setIsSavingDefaultModel] = useState(false);
+  const [imageGenerationModelId, setImageGenerationModelId] = useState('');
+  const [imageGenerationFallbacks, setImageGenerationFallbacks] = useState<string[]>([]);
+  const [imageGenerationFallbackMode, setImageGenerationFallbackMode] = useState<ModelFallbackMode>('disabled');
+  const [imageGenerationModelError, setImageGenerationModelError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
+  const [isSavingImageGenerationModel, setIsSavingImageGenerationModel] = useState(false);
   const [globalFallbacks, setGlobalFallbacks] = useState<string[]>([]);
   const [globalFallbackMode, setGlobalFallbackMode] = useState<ModelFallbackMode>('disabled');
   const [globalFallbackError, setGlobalFallbackError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
@@ -743,6 +748,21 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [newModelAlias, setNewModelAlias] = useState('');
   const [newModelInput, setNewModelInput] = useState<string[]>(['text']);
   const [modelError, setModelError] = useState('');
+
+  const modelSupportsImageGeneration = (model: { input?: string[] }) => (
+    (model.input || []).some((capability) => {
+      const normalized = capability.toLowerCase().replace(/[-\s]+/g, '_');
+      return normalized === 'image_generation' || normalized === 'image_generate' || normalized === 'image_output';
+    })
+  );
+
+  const sortModelsByDisplayName = <T extends { id: string; alias?: string }>(items: T[]) => (
+    [...items].sort((a, b) => {
+      const labelA = a.alias || a.id;
+      const labelB = b.alias || b.id;
+      return labelA.localeCompare(labelB, undefined, { sensitivity: 'base' });
+    })
+  );
 
   const [editingModelId, setEditingModelId] = useState<string | null>(null);
   const [editingAlias, setEditingAlias] = useState('');
@@ -828,6 +848,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
     fetchCommands();
     fetchModels();
+    fetchImageGenerationModelConfig();
     fetchGlobalFallbacks();
     fetchEndpoints();
 
@@ -1722,6 +1743,28 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     }
   };
 
+  const fetchImageGenerationModelConfig = async () => {
+    try {
+      const res = await fetch('/api/models/image-generation');
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        const primary = typeof data?.config?.primary === 'string' ? data.config.primary : '';
+        const fallbacks = Array.isArray(data?.config?.fallbacks) ? data.config.fallbacks : [];
+        setImageGenerationModelId(primary);
+        setImageGenerationFallbacks(fallbacks);
+        setImageGenerationFallbackMode(fallbacks.length > 0 ? 'custom' : 'disabled');
+        setImageGenerationModelError(EMPTY_INLINE_ERROR);
+      } else {
+        setImageGenerationModelError(resolveStructuredErrorDisplay(data, t, 'settings.models.imageGenerationLoadFailed'));
+      }
+    } catch (err) {
+      setImageGenerationModelError({
+        message: t('settings.models.imageGenerationLoadFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+    }
+  };
+
   const fetchGlobalFallbacks = async () => {
     try {
       const res = await fetch('/api/models/fallbacks');
@@ -1812,6 +1855,45 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     }
   };
 
+  const handleSaveImageGenerationModelConfig = async (primary: string, fallbacks: string[]) => {
+    const normalizedPrimary = primary.trim();
+    const normalizedFallbacks = Array.from(new Set(fallbacks.filter((id) => id && id !== normalizedPrimary)));
+    setImageGenerationModelError(EMPTY_INLINE_ERROR);
+    setIsSavingImageGenerationModel(true);
+
+    try {
+      const res = await fetch('/api/models/image-generation', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          primary: normalizedPrimary || null,
+          fallbacks: normalizedPrimary ? normalizedFallbacks : [],
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+
+      if (res.ok && data.success) {
+        const nextPrimary = typeof data?.config?.primary === 'string' ? data.config.primary : '';
+        const nextFallbacks = Array.isArray(data?.config?.fallbacks) ? data.config.fallbacks : [];
+        setImageGenerationModelId(nextPrimary);
+        setImageGenerationFallbacks(nextFallbacks);
+        setImageGenerationFallbackMode(nextFallbacks.length > 0 ? 'custom' : 'disabled');
+        return;
+      }
+
+      setImageGenerationModelError(resolveStructuredErrorDisplay(data, t, 'settings.models.imageGenerationSaveFailed'));
+      await fetchImageGenerationModelConfig();
+    } catch (err) {
+      setImageGenerationModelError({
+        message: t('settings.models.imageGenerationSaveFailed'),
+        detail: err instanceof Error && err.message.trim() ? err.message.trim() : '',
+      });
+      await fetchImageGenerationModelConfig();
+    } finally {
+      setIsSavingImageGenerationModel(false);
+    }
+  };
+
   useEffect(() => {
     if (suppressGlobalFallbackAutosaveRef.current) return;
     if (globalFallbackMode === 'custom' && globalFallbacks.length === 0) return;
@@ -1847,6 +1929,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   // Capability definitions
   const CAPABILITIES = [
     { id: 'image',     label: t('settings.models.capability.image'), Icon: Eye,         color: 'text-violet-600 bg-violet-50 border-violet-200' },
+    { id: 'image_generation', label: t('settings.models.capability.imageGeneration'), Icon: ImageIcon, color: 'text-emerald-600 bg-emerald-50 border-emerald-200' },
     { id: 'reasoning', label: t('settings.models.capability.reasoning'), Icon: Zap,         color: 'text-amber-600 bg-amber-50 border-amber-200' },
     { id: 'tools',     label: t('settings.models.capability.tools'), Icon: Wrench,      color: 'text-pink-600 bg-pink-50 border-pink-200' },
     { id: 'web',       label: t('settings.models.capability.web'), Icon: Globe,       color: 'text-blue-600 bg-blue-50 border-blue-200' },
@@ -1858,6 +1941,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     const id = modelId.toLowerCase();
     const caps = new Set<string>(['text']);
     if (/vision|4v|claude-3|claude-opus|claude-sonnet|claude-haiku|gpt-4o|gpt-4-turbo|gemini|llava|qwen.*vl|intern.*vl|glm-4v|minicpm.*v|cogvlm|pixtral|phi.*vision|qvq|kimi.*vl|chatglm.*vl|(^|\/)gpt-5\.4$/.test(id)) caps.add('image');
+    if (/gpt[-_.]?image|dall[-_.]?e|imagen|flux|sdxl|stable[-_.]?diffusion|seedream|jimeng|image[-_.]?01|grok[-_.]?imagine|gemini.*image|image[-_.]?preview|comfy.*workflow|workflow.*comfy/.test(id)) caps.add('image_generation');
     if (/o1|o3|o4|thinking|reasoning|deepthink|r1|r2/.test(id)) caps.add('reasoning');
     if (/embed|embedding|text-embedding|bge|e5-/.test(id)) caps.add('embed');
     if (/rerank|reranker|bce-reranker/.test(id)) caps.add('rerank');
@@ -1925,9 +2009,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
   const handleTestSingleModel = async (modelId: string, e?: React.MouseEvent, signal?: AbortSignal) => {
     if (e) e.stopPropagation();
+    const shouldUseImageGenerationTest = guessCapabilities(modelId).includes('image_generation');
     setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'testing', message: '' }}));
     try {
-      const res = await fetch('/api/models/test', {
+      const res = await fetch(shouldUseImageGenerationTest ? '/api/models/test-image-generation' : '/api/models/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ endpoint: newModelEndpoint.trim(), modelName: modelId }),
@@ -1935,13 +2020,17 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       });
       const data = await res.json().catch(() => ({}));
       if (data.success) {
-        setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'success', message: 'OK' }}));
+        setIndividualTestStatus(prev => ({
+          ...prev,
+          [modelId]: {
+            status: 'success',
+            message: shouldUseImageGenerationTest ? t('settings.models.imageGenerationLightCheckGood') : 'OK',
+            detail: typeof data.warning === 'string' && data.warning.trim() ? data.warning.trim() : undefined,
+          },
+        }));
       } else {
-        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.connectivityFailed');
+        const display = resolveStructuredErrorDisplay(data, t, shouldUseImageGenerationTest ? 'settings.models.imageGenerationLightCheckFailed' : 'settings.models.connectivityFailed');
         setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'error', message: display.message, detail: display.detail || undefined }}));
-        if (!signal && display.detail) {
-          openSettingsErrorModal(display.message, display.detail);
-        }
       }
     } catch (err: any) {
       if (err.name === 'AbortError') {
@@ -1955,17 +2044,15 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
         const message = t('settings.models.testNetworkError');
         setIndividualTestStatus(prev => ({...prev, [modelId]: { status: 'error', message, detail: detail || undefined }}));
-        if (!signal && detail) {
-          openSettingsErrorModal(message, detail);
-        }
       }
     }
   };
 
   const handleTestExistingSingleModel = async (fullModelId: string, endpoint: string, modelName: string) => {
+    const shouldUseImageGenerationTest = modelSupportsImageGeneration(models.find((model) => model.id === fullModelId) || {});
     setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'testing' } }));
     try {
-      const res = await fetch('/api/models/test', {
+      const res = await fetch(shouldUseImageGenerationTest ? '/api/models/test-image-generation' : '/api/models/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ endpoint, modelName })
@@ -1973,21 +2060,22 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       const data = await res.json().catch(() => ({}));
 
       if (res.ok && data.success) {
-        setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'success' } }));
+        setExistingModelTestStatus(prev => ({
+          ...prev,
+          [fullModelId]: {
+            status: 'success',
+            message: shouldUseImageGenerationTest ? t('settings.models.imageGenerationLightCheckGood') : undefined,
+            detail: typeof data.warning === 'string' && data.warning.trim() ? data.warning.trim() : undefined,
+          },
+        }));
       } else {
-        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.connectivityFailed');
+        const display = resolveStructuredErrorDisplay(data, t, shouldUseImageGenerationTest ? 'settings.models.imageGenerationLightCheckFailed' : 'settings.models.connectivityFailed');
         setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'error', message: display.message, detail: display.detail || undefined } }));
-        if (display.detail) {
-          openSettingsErrorModal(display.message, display.detail);
-        }
       }
     } catch (err: any) {
       const detail = typeof err?.message === 'string' && err.message.trim() ? err.message.trim() : '';
       const message = t('settings.models.testNetworkError');
       setExistingModelTestStatus(prev => ({ ...prev, [fullModelId]: { status: 'error', message, detail: detail || undefined } }));
-      if (detail) {
-        openSettingsErrorModal(message, detail);
-      }
     }
   };
 
@@ -2899,6 +2987,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         if (res.ok) {
           setModelActionError(EMPTY_INLINE_ERROR);
           fetchModels();
+          fetchImageGenerationModelConfig();
           fetchGlobalFallbacks();
   
         } else {
@@ -2914,6 +3003,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         if (res.ok) {
           setModelActionError(EMPTY_INLINE_ERROR);
           fetchModels();
+          fetchImageGenerationModelConfig();
           fetchGlobalFallbacks();
           fetchEndpoints();
   
@@ -2956,9 +3046,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       return false;
     }
     setAddModelTestStatus('testing');
-    setAddModelTestMessage(t('settings.models.testingConnectivity'));
+    const shouldUseImageGenerationTest = modelSupportsImageGeneration({ input: newModelInput });
+    setAddModelTestMessage(shouldUseImageGenerationTest ? t('settings.models.imageGenerationLightChecking') : t('settings.models.testingConnectivity'));
     try {
-      const res = await fetch('/api/models/test', {
+      const res = await fetch(shouldUseImageGenerationTest ? '/api/models/test-image-generation' : '/api/models/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -2971,16 +3062,16 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       if (res.ok && data.success) {
         setAddModelTestStatus('success');
         const latency = data.latency !== undefined ? `${data.latency}ms` : t('settings.models.unknownLatency');
-        setAddModelTestMessage(t('settings.models.connectivityGood', { latency }));
+        setAddModelTestMessage(shouldUseImageGenerationTest
+          ? t('settings.models.imageGenerationLightCheckGoodWithLatency', { latency })
+          : t('settings.models.connectivityGood', { latency }));
+        setTestModelMessage(typeof data.warning === 'string' && data.warning.trim() ? data.warning.trim() : '');
         return true;
       } else {
-        const display = resolveStructuredErrorDisplay(data, t, 'settings.models.connectivityFailed');
+        const display = resolveStructuredErrorDisplay(data, t, shouldUseImageGenerationTest ? 'settings.models.imageGenerationLightCheckFailed' : 'settings.models.connectivityFailed');
         setAddModelTestStatus('error');
         setAddModelTestMessage(display.message);
         setTestModelMessage(display.detail || display.message);
-        if (display.detail) {
-          openSettingsErrorModal(display.message, display.detail);
-        }
         return false;
       }
     } catch (err: any) {
@@ -2989,9 +3080,6 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       setAddModelTestStatus('error');
       setAddModelTestMessage(message);
       setTestModelMessage(detail || message);
-      if (detail) {
-        openSettingsErrorModal(message, detail);
-      }
       return false;
     }
   };
@@ -3135,6 +3223,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         setEditingAlias('');
         setEditingInput([]);
         fetchModels();
+        fetchImageGenerationModelConfig();
 
       } else {
         const data = await res.json().catch(() => ({}));
@@ -3250,6 +3339,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     ...models.map(m => m.id.split('/')[0]).filter(Boolean)
   ])).sort((a, b) => a.localeCompare(b));
   const currentPrimaryModelId = models.find((model) => model.primary)?.id || '';
+  const sortedModels = sortModelsByDisplayName(models);
+  const imageGenerationModels = sortModelsByDisplayName(models.filter(modelSupportsImageGeneration));
+  const hasImageGenerationModels = imageGenerationModels.length > 0;
+  const newModelUsesImageGeneration = modelSupportsImageGeneration({ input: newModelInput });
 
   const currentLanguage = normalizeLanguage(i18n.resolvedLanguage || i18n.language);
   const openClawCurrentVersion = detectedOpenClawVersion
@@ -5039,7 +5132,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                                                 }}
                                                 disabled={existingModelTestStatus[model.id]?.status === 'testing'}
                                                 className={`p-1.5 rounded-lg transition-colors ${ existingModelTestStatus[model.id]?.status === 'testing' ? 'text-gray-300 cursor-not-allowed' : 'text-gray-400 hover:text-purple-600 hover:bg-purple-50' }`}
-                                                title={t('settings.models.testAvailability')}
+                                                title={modelSupportsImageGeneration(model) ? t('settings.models.testImageGenerationLight') : t('settings.models.testAvailability')}
                                               >
                                                 <Activity className="w-4 h-4" />
                                               </button>
@@ -5136,11 +5229,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
                 <div className="min-w-0 rounded-2xl border border-gray-200 bg-white p-4 sm:p-6">
                   <ModelSinglePicker
-                    availableModels={[...models].sort((a, b) => {
-                      const labelA = a.alias || a.id;
-                      const labelB = b.alias || b.id;
-                      return labelA.localeCompare(labelB, undefined, { sensitivity: 'base' });
-                    })}
+                    availableModels={sortedModels}
                     selectedModelId={defaultModelId}
                     onSelectedModelIdChange={(id) => {
                       void handleSaveDefaultModelSelection(id);
@@ -5150,6 +5239,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                     allModelsTabLabel={t('sidebar.allModels')}
                     defaultBadgeLabel={t('settings.models.defaultTag')}
                     visionBadgeLabel={t('sidebar.visionModel')}
+                    imageGenerationBadgeLabel={t('settings.models.imageGenerationBadge')}
                     disabled={isSavingDefaultModel || models.length === 0}
                   />
                 </div>
@@ -5224,10 +5314,141 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                     defaultBadgeLabel={t('settings.models.defaultTag')}
                     allModelsTabLabel={t('sidebar.allModels')}
                     visionBadgeLabel={t('sidebar.visionModel')}
+                    imageGenerationBadgeLabel={t('settings.models.imageGenerationBadge')}
                     selectionUiVariant="model-picker"
                     className="min-w-0"
                   />
                 ) : null}
+              </div>
+
+              <div className="space-y-4 pt-2">
+                <div className="space-y-1">
+                  <h3 className="text-lg font-semibold text-gray-900">
+                    {t('settings.models.imageGenerationTitle')}
+                  </h3>
+                  <p className="text-sm text-gray-500 leading-relaxed">
+                    {t('settings.models.imageGenerationDescription')}
+                  </p>
+                </div>
+
+                {imageGenerationModelError.message ? (
+                  <div className="rounded-xl border border-red-100 bg-red-50 px-4 py-3 text-sm text-red-600">
+                    <div>{imageGenerationModelError.message}</div>
+                    {imageGenerationModelError.detail ? (
+                      <div className="mt-2 rounded-lg border border-red-100 bg-white/80 px-3 py-2 text-xs text-red-500 whitespace-pre-wrap break-all font-mono">
+                        {imageGenerationModelError.detail}
+                      </div>
+                    ) : null}
+                  </div>
+                ) : null}
+
+                <div className="min-w-0 space-y-4 rounded-2xl border border-gray-200 bg-white p-4 sm:p-6">
+                  <ModelSinglePicker
+                    availableModels={imageGenerationModels}
+                    selectedModelId={imageGenerationModelId}
+                    onSelectedModelIdChange={(id) => {
+                      const nextFallbacks = imageGenerationFallbacks.filter((fallbackId) => fallbackId !== id);
+                      setImageGenerationModelId(id);
+                      setImageGenerationFallbacks(nextFallbacks);
+                      if (nextFallbacks.length === 0) {
+                        setImageGenerationFallbackMode('disabled');
+                      }
+                      void handleSaveImageGenerationModelConfig(id, nextFallbacks);
+                    }}
+                    placeholder={t('settings.models.imageGenerationPlaceholder')}
+                    emptyText={t('settings.models.imageGenerationEmpty')}
+                    allModelsTabLabel={t('sidebar.allModels')}
+                    defaultBadgeLabel={t('settings.models.defaultTag')}
+                    visionBadgeLabel={t('sidebar.visionModel')}
+                    imageGenerationBadgeLabel={t('settings.models.imageGenerationBadge')}
+                    disabled={isSavingImageGenerationModel || !hasImageGenerationModels}
+                  />
+
+                  {!imageGenerationModelId ? (
+                    <div className="rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 text-sm text-gray-500">
+                      {hasImageGenerationModels
+                        ? t('settings.models.imageGenerationOpenClawDefaultHint')
+                        : t('settings.models.imageGenerationNoSupportedHint')}
+                    </div>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="space-y-4 pt-2">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-lg font-semibold text-gray-900 mb-1">
+                      {t('settings.models.imageGenerationFallbackTitle')}
+                    </h3>
+                    <p className="text-sm text-gray-500 leading-relaxed">
+                      {t('settings.models.imageGenerationFallbackDescription')}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={Boolean(imageGenerationModelId) && imageGenerationFallbackMode !== 'disabled'}
+                    aria-label={t('settings.models.imageGenerationFallbackTitle')}
+                    disabled={!imageGenerationModelId || isSavingImageGenerationModel}
+                    onClick={() => {
+                      if (!imageGenerationModelId) return;
+                      if (imageGenerationFallbackMode === 'disabled') {
+                        setImageGenerationFallbackMode('custom');
+                        return;
+                      }
+                      setImageGenerationFallbackMode('disabled');
+                      setImageGenerationFallbacks([]);
+                      void handleSaveImageGenerationModelConfig(imageGenerationModelId, []);
+                    }}
+                    className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500/20 disabled:cursor-not-allowed disabled:opacity-60 ${imageGenerationModelId && imageGenerationFallbackMode !== 'disabled' ? 'bg-blue-600' : 'bg-gray-200'}`}
+                  >
+                    <span
+                      className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform duration-200 ease-in-out ${imageGenerationModelId && imageGenerationFallbackMode !== 'disabled' ? 'translate-x-6' : 'translate-x-1'}`}
+                    />
+                  </button>
+                </div>
+
+                {imageGenerationModelId ? (
+                  imageGenerationFallbackMode !== 'disabled' ? (
+                    <ModelFallbackEditor
+                      availableModels={imageGenerationModels}
+                      mode={imageGenerationFallbackMode}
+                      onModeChange={(mode) => setImageGenerationFallbackMode(mode)}
+                      selectedModelIds={imageGenerationFallbacks}
+                      onSelectedModelIdsChange={(ids) => {
+                        const nextIds = ids.filter((id) => id !== imageGenerationModelId);
+                        setImageGenerationFallbacks(nextIds);
+                        setImageGenerationFallbackMode(nextIds.length > 0 ? 'custom' : 'disabled');
+                        void handleSaveImageGenerationModelConfig(imageGenerationModelId, nextIds);
+                      }}
+                      excludedModelIds={[imageGenerationModelId]}
+                      title=""
+                      description=""
+                      customLabel={t('settings.models.fallbackModeCustom')}
+                      customHint=""
+                      disabledLabel={t('settings.models.fallbackModeDisabled')}
+                      disabledHint=""
+                      hideModeSelector
+                      searchPlaceholder={t('settings.models.imageGenerationFallbackSearchPlaceholder')}
+                      selectedTitle={t('settings.models.fallbackSelectedTitle')}
+                      availableTitle={t('settings.models.fallbackAvailableTitle')}
+                      emptySelectedText={t('settings.models.fallbackSelectedEmpty')}
+                      emptyAvailableText={t('settings.models.fallbackAvailableEmpty')}
+                      defaultBadgeLabel={t('settings.models.defaultTag')}
+                      allModelsTabLabel={t('sidebar.allModels')}
+                      visionBadgeLabel={t('sidebar.visionModel')}
+                      imageGenerationBadgeLabel={t('settings.models.imageGenerationBadge')}
+                      selectionUiVariant="model-picker"
+                      className="min-w-0"
+                    />
+                  ) : null
+                ) : (
+                  <div className="rounded-xl border border-gray-100 bg-gray-50 px-4 py-3 text-sm text-gray-500">
+                    {hasImageGenerationModels
+                      ? t('settings.models.imageGenerationFallbackNeedsPrimary')
+                      : t('settings.models.imageGenerationNoSupportedHint')}
+                  </div>
+                )}
               </div>
             </div>
           )}
@@ -6364,7 +6585,7 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                 onClick={handleTestModel}
                 disabled={addModelTestStatus === 'testing' || !newModelEndpoint.trim() || !newModelName.trim()}
                 className={`flex-[1.5] px-3 py-2.5 rounded-xl font-semibold transition-all flex items-center justify-center gap-1.5 disabled:opacity-50 text-sm overflow-hidden ${ addModelTestStatus === 'testing' ? 'bg-blue-50 text-blue-600 border border-blue-200' : addModelTestStatus === 'success' ? 'bg-green-50 text-green-600 border border-green-200' : addModelTestStatus === 'error' ? 'bg-red-50 text-red-600 border border-red-200' : 'bg-indigo-50 text-indigo-700 border border-indigo-200 hover:text-indigo-800 hover:bg-indigo-100' }`}
-                title={addModelTestStatus !== 'idle' ? addModelTestMessage : t('settings.models.testThisModel')}
+                title={addModelTestStatus !== 'idle' ? addModelTestMessage : (newModelUsesImageGeneration ? t('settings.models.testImageGenerationLight') : t('settings.models.testThisModel'))}
               >
                 {addModelTestStatus === 'testing' ? <Loader2 className="w-4 h-4 animate-spin shrink-0" /> :
                  addModelTestStatus === 'success' ? <Check className="w-4 h-4 shrink-0" /> :

@@ -245,13 +245,25 @@ export class OpenClawClient extends EventEmitter {
     this.config = config;
   }
 
+  private hasOpenSocket(): boolean {
+    return this.connected && this.ws?.readyState === WebSocket.OPEN;
+  }
+
   isConnected(): boolean {
-    return this.connected;
+    return this.hasOpenSocket();
   }
 
   async connect(): Promise<void> {
-    if (this.connected) return;
+    if (this.hasOpenSocket()) return;
     if (this.connectPromise) return this.connectPromise;
+    if (this.ws && this.ws.readyState !== WebSocket.OPEN) {
+      try {
+        this.ws.close();
+      } catch {}
+      this.ws = null;
+      this.connected = false;
+      this.sessionEventSubscriptionRefs = 0;
+    }
 
     this.connectPromise = new Promise((resolve, reject) => {
       const wsUrl = this.config.gatewayUrl.replace(/^http/, 'ws');
@@ -405,7 +417,9 @@ export class OpenClawClient extends EventEmitter {
   }
 
   private async request(method: string, params?: any, timeoutMs = 60000): Promise<any> {
-    if (!this.ws) throw new Error('WebSocket not initialized');
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error('OpenClaw gateway connection is not open');
+    }
 
     const id = crypto.randomUUID();
     const frame = { type: 'req', id, method, params };
@@ -417,12 +431,19 @@ export class OpenClawClient extends EventEmitter {
       }, timeoutMs);
 
       this.pending.set(id, { resolve, reject, timer });
-      this.ws!.send(JSON.stringify(frame));
+      this.ws!.send(JSON.stringify(frame), (error) => {
+        if (!error) return;
+        clearTimeout(timer);
+        this.pending.delete(id);
+        this.connected = false;
+        this.sessionEventSubscriptionRefs = 0;
+        reject(error);
+      });
     });
   }
 
   async call(method: string, params?: any, timeoutMs = 60000): Promise<any> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -430,7 +451,7 @@ export class OpenClawClient extends EventEmitter {
   }
 
   async subscribeSessionEvents(): Promise<void> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -457,7 +478,7 @@ export class OpenClawClient extends EventEmitter {
       return;
     }
 
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       return;
     }
 
@@ -470,7 +491,7 @@ export class OpenClawClient extends EventEmitter {
   }
 
   async waitForRun(runId: string, timeoutMs = 90000): Promise<void> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -483,7 +504,7 @@ export class OpenClawClient extends EventEmitter {
   }
 
   async getChatHistory(sessionKey: string, limit = 20): Promise<any> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -494,7 +515,7 @@ export class OpenClawClient extends EventEmitter {
   }
 
   async getGatewayStatus(timeoutMs = 10000): Promise<any> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -502,7 +523,7 @@ export class OpenClawClient extends EventEmitter {
   }
 
   async getGatewayHealth(timeoutMs = 10000): Promise<any> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -528,7 +549,7 @@ export class OpenClawClient extends EventEmitter {
     agentId?: string;
     attachments?: { type: string; mimeType: string; content: string }[];
   }): Promise<{ runId: string; sessionKey: string }> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -556,7 +577,7 @@ export class OpenClawClient extends EventEmitter {
     message: string;
     agentId?: string;
   }): Promise<string> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -590,7 +611,7 @@ export class OpenClawClient extends EventEmitter {
     runId?: string;
     timeoutMs?: number;
   }): Promise<{ aborted: boolean; runIds?: string[] }> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
 
@@ -608,10 +629,10 @@ export class OpenClawClient extends EventEmitter {
   }
 
   async testConnection(): Promise<boolean> {
-    if (!this.connected) {
+    if (!this.hasOpenSocket()) {
       await this.connect();
     }
-    return this.connected;
+    return this.hasOpenSocket();
   }
 
   disconnect(): void {

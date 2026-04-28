@@ -103,6 +103,15 @@ export type StoredFileRow = {
   created_at?: string;
 };
 
+export type CapabilityCacheRow = {
+  key: string;
+  value: string;
+  openclaw_version?: string | null;
+  status: 'success' | 'error';
+  error_detail?: string | null;
+  updated_at?: string;
+};
+
 export class DB {
   private db: Database.Database;
 
@@ -120,6 +129,15 @@ export class DB {
       CREATE TABLE IF NOT EXISTS config (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS openclaw_capability_cache (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL DEFAULT '{}',
+        openclaw_version TEXT,
+        status TEXT NOT NULL DEFAULT 'success',
+        error_detail TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       );
 
       CREATE TABLE IF NOT EXISTS chat_messages (
@@ -318,6 +336,54 @@ export class DB {
     this.db
       .prepare('INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
       .run(key, value);
+  }
+
+  getCapabilityCache(key: string): CapabilityCacheRow | undefined {
+    return this.db
+      .prepare('SELECT key, value, openclaw_version, status, error_detail, updated_at FROM openclaw_capability_cache WHERE key = ?')
+      .get(key) as CapabilityCacheRow | undefined;
+  }
+
+  upsertCapabilityCache(row: {
+    key: string;
+    value: string;
+    openclawVersion?: string | null;
+    status?: 'success' | 'error';
+    errorDetail?: string | null;
+  }) {
+    this.db
+      .prepare(`
+        INSERT INTO openclaw_capability_cache (key, value, openclaw_version, status, error_detail, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          value = excluded.value,
+          openclaw_version = excluded.openclaw_version,
+          status = excluded.status,
+          error_detail = excluded.error_detail,
+          updated_at = CURRENT_TIMESTAMP
+      `)
+      .run(
+        row.key,
+        row.value,
+        row.openclawVersion || null,
+        row.status || 'success',
+        row.errorDetail || null,
+      );
+  }
+
+  markCapabilityCacheError(key: string, errorDetail: string, openclawVersion?: string | null) {
+    const existing = this.getCapabilityCache(key);
+    this.db
+      .prepare(`
+        INSERT INTO openclaw_capability_cache (key, value, openclaw_version, status, error_detail, updated_at)
+        VALUES (?, ?, ?, 'error', ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(key) DO UPDATE SET
+          openclaw_version = COALESCE(excluded.openclaw_version, openclaw_capability_cache.openclaw_version),
+          status = excluded.status,
+          error_detail = excluded.error_detail,
+          updated_at = CURRENT_TIMESTAMP
+      `)
+      .run(key, existing?.value || '{}', openclawVersion || null, errorDetail);
   }
 
   saveMessage(row: ChatRow): number | bigint {

@@ -35,6 +35,7 @@ import { rewriteVisibleFileLinks } from './file-link-rewrite';
 import { getGroupRuntimeSessionKey } from './group-workspace';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
 import { canonicalizeAssistantWorkspaceArtifacts } from './workspace-artifact-rewrite';
+import { isLikelyImageGenerationPrompt } from './image-generation-routing';
 
 const DEFAULT_MAX_CHAIN_DEPTH = 6;
 const GROUP_STREAM_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -97,6 +98,21 @@ type PendingGroupRun = {
   processContent: string;
   processStreaming: boolean;
 };
+
+type GroupDirectImageGenerationResult = {
+  content: string;
+  processContent: string;
+  modelUsed: string;
+  imagePath: string;
+};
+
+export type GroupDirectImageGenerationHandler = (params: {
+  prompt: string;
+  intentText?: string;
+  outputDir: string;
+}) => Promise<GroupDirectImageGenerationResult | null>;
+
+export type GroupDirectImageGenerationStartProcessBuilder = () => string | null;
 
 type SplitGroupProcessOutputResult = {
   finalContent: string;
@@ -802,6 +818,8 @@ export class GroupChatEngine extends EventEmitter {
       uploadsPath: string;
       outputPath: string;
   }>;
+  private tryGenerateImageForPrompt?: GroupDirectImageGenerationHandler;
+  private buildImageGenerationStartProcessContent?: GroupDirectImageGenerationStartProcessBuilder;
   private pendingRuns = new Map<string, PendingGroupRun>();
   private activeRuns = new Map<string, ActiveGroupRun>();
 
@@ -815,7 +833,9 @@ export class GroupChatEngine extends EventEmitter {
       workspacePath: string;
       uploadsPath: string;
       outputPath: string;
-    }>
+    }>,
+    tryGenerateImageForPrompt?: GroupDirectImageGenerationHandler,
+    buildImageGenerationStartProcessContent?: GroupDirectImageGenerationStartProcessBuilder
   ) {
     super();
     this.db = db;
@@ -823,6 +843,8 @@ export class GroupChatEngine extends EventEmitter {
     this.getAgentModel = getAgentModel;
     this.getPreferredLanguage = getPreferredLanguage;
     this.prepareGroupRuntime = prepareGroupRuntime;
+    this.tryGenerateImageForPrompt = tryGenerateImageForPrompt;
+    this.buildImageGenerationStartProcessContent = buildImageGenerationStartProcessContent;
   }
 
   private emitRunState(groupId: string) {
@@ -1421,6 +1443,60 @@ export class GroupChatEngine extends EventEmitter {
         );
       this.throwIfGroupReset(groupId, effectiveResetEpoch);
       const promptInput = [rewrittenTrigger.text, imageInspectionContext, documentToolingContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
+
+      const imageGenerationStartProcessContent = !isResetCommand && isLikelyImageGenerationPrompt(triggerMsg)
+        ? this.buildImageGenerationStartProcessContent?.()
+        : null;
+      if (imageGenerationStartProcessContent && msgId !== undefined) {
+        latestProcessOutput = imageGenerationStartProcessContent;
+        this.db.updateGroupMessage(msgId, '', modelUsed, null, imageGenerationStartProcessContent);
+        this.emit('edit', {
+          groupId,
+          id: msgId,
+          parent_id: parentId,
+          sender_type: 'agent',
+          sender_id: agentId,
+          sender_name: member.display_name,
+          content: '',
+          process_content: rewriteVisibleFileLinks(imageGenerationStartProcessContent, { workspacePath: runtimeContext.workspacePath }).trim(),
+          process_streaming: true,
+          model_used: modelUsed,
+          created_at: placeholderCreatedAt,
+        });
+      }
+
+      const directImageResult = !isResetCommand && this.tryGenerateImageForPrompt
+        ? await this.tryGenerateImageForPrompt({
+          prompt: promptInput,
+          intentText: triggerMsg,
+          outputDir: runtimeContext.outputPath,
+        })
+        : null;
+      if (directImageResult && msgId !== undefined) {
+        this.throwIfGroupReset(groupId, effectiveResetEpoch);
+        latestProcessOutput = directImageResult.processContent;
+        this.db.updateGroupMessage(
+          msgId,
+          directImageResult.content,
+          directImageResult.modelUsed,
+          null,
+          directImageResult.processContent,
+        );
+        this.emit('edit', {
+          groupId,
+          id: msgId,
+          parent_id: parentId,
+          sender_type: 'agent',
+          sender_id: agentId,
+          sender_name: member.display_name,
+          content: rewriteVisibleFileLinks(directImageResult.content, { workspacePath: runtimeContext.workspacePath }).trim(),
+          process_content: rewriteVisibleFileLinks(directImageResult.processContent, { workspacePath: runtimeContext.workspacePath }).trim(),
+          process_streaming: false,
+          model_used: directImageResult.modelUsed,
+          created_at: placeholderCreatedAt,
+        });
+        return msgId;
+      }
 
       const prompt = isResetCommand 
         ? triggerMsg
