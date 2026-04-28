@@ -104,7 +104,7 @@ type SplitGroupProcessOutputResult = {
   processStreaming: boolean;
 };
 
-type GroupToolProgressLocale = 'zh-CN' | 'zh-TW' | 'en';
+export type GroupToolProgressLocale = 'zh-CN' | 'zh-TW' | 'en';
 
 type GroupToolProgressKind =
   | 'browse'
@@ -118,7 +118,7 @@ type GroupToolProgressKind =
   | 'view_image'
   | 'wait_agent';
 
-type GroupToolProgressState = {
+export type GroupToolProgressState = {
   toolName: string;
   args?: Record<string, unknown>;
 };
@@ -226,7 +226,7 @@ function normalizeGroupPromptText(value: string): string {
     .trim();
 }
 
-function normalizeGroupToolProgressLocale(value?: string | null): GroupToolProgressLocale {
+export function normalizeGroupToolProgressLocale(value?: string | null): GroupToolProgressLocale {
   return value === 'zh-TW' || value === 'en' ? value : 'zh-CN';
 }
 
@@ -249,7 +249,7 @@ function truncateGroupToolProgressText(value: string, maxChars = GROUP_TOOL_PROG
   return `${normalized.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`;
 }
 
-function normalizeToolArgsRecord(args: unknown): Record<string, unknown> | undefined {
+export function normalizeToolArgsRecord(args: unknown): Record<string, unknown> | undefined {
   return args && typeof args === 'object' && !Array.isArray(args)
     ? args as Record<string, unknown>
     : undefined;
@@ -374,7 +374,7 @@ function buildToolProgressLine(locale: GroupToolProgressLocale, label: string, d
   return normalizedDetail ? `- ${label}${separator}${normalizedDetail}` : `- ${label}`;
 }
 
-function formatToolStartProgress(locale: GroupToolProgressLocale, toolName: string, args?: Record<string, unknown>): string {
+export function formatToolStartProgress(locale: GroupToolProgressLocale, toolName: string, args?: Record<string, unknown>): string {
   const text = GROUP_TOOL_PROGRESS_TEXT[locale];
   const detail = resolveToolProgressDetail(toolName, args);
 
@@ -402,7 +402,7 @@ function formatToolStartProgress(locale: GroupToolProgressLocale, toolName: stri
   }
 }
 
-function formatToolResultProgress(locale: GroupToolProgressLocale, toolName: string, args: Record<string, unknown> | undefined, isError: boolean): string {
+export function formatToolResultProgress(locale: GroupToolProgressLocale, toolName: string, args: Record<string, unknown> | undefined, isError: boolean): string {
   const text = GROUP_TOOL_PROGRESS_TEXT[locale];
   const detail = resolveToolProgressDetail(toolName, args);
 
@@ -437,7 +437,7 @@ function formatToolResultProgress(locale: GroupToolProgressLocale, toolName: str
   }
 }
 
-function appendToolProgressLine(lines: string[], line: string): boolean {
+export function appendToolProgressLine(lines: string[], line: string): boolean {
   const normalizedLine = line.trim();
   if (!normalizedLine) return false;
   if (lines[lines.length - 1] === normalizedLine) {
@@ -451,7 +451,7 @@ function appendToolProgressLine(lines: string[], line: string): boolean {
   return true;
 }
 
-function mergeGroupProcessContent(...sections: Array<string | null | undefined>): string {
+export function mergeGroupProcessContent(...sections: Array<string | null | undefined>): string {
   return sections
     .map((section) => normalizeGroupPromptText(section || ''))
     .filter(Boolean)

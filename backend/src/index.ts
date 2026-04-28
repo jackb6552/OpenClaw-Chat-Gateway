@@ -13,7 +13,18 @@ import SessionManager from './session-manager';
 import ConfigManager from './config-manager';
 import DB from './db';
 import AgentProvisioner from './agent-provisioner';
-import { GroupChatEngine, createAgentResponseFailedMessage, getStructuredGroupMessage } from './group-chat-engine';
+import {
+  GroupChatEngine,
+  appendToolProgressLine,
+  createAgentResponseFailedMessage,
+  formatToolResultProgress,
+  formatToolStartProgress,
+  getStructuredGroupMessage,
+  mergeGroupProcessContent,
+  normalizeGroupToolProgressLocale,
+  normalizeToolArgsRecord,
+  type GroupToolProgressState,
+} from './group-chat-engine';
 import {
   deleteGroupWorkspace,
   ensureGroupWorkspace,
@@ -5408,17 +5419,21 @@ function withStructuredGroupMessage<T extends {
   };
 }
 
-function withStructuredChatMessage<T extends { content?: string | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null }>(
+function withStructuredChatMessage<T extends { content?: string | null; process_content?: string | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams | null; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null }>(
   message: T,
   options?: { sessionId?: string | null }
-): T & { role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null } {
+): T & { process_content?: string | null; role?: 'user' | 'assistant' | 'system'; messageCode?: string; messageParams?: StructuredMessageParams; rawDetail?: string | null; agent_id?: string | null; agent_name?: string | null } {
   const content = typeof message.content === 'string'
     ? rewriteOpenClawMediaPaths(message.content, options?.sessionId ? getSessionWorkspacePath(options.sessionId) : undefined)
     : message.content;
+  const processContent = typeof message.process_content === 'string'
+    ? rewriteOpenClawMediaPaths(message.process_content, options?.sessionId ? getSessionWorkspacePath(options.sessionId) : undefined)
+    : message.process_content;
   const structured = getStructuredChatMessage(content);
   return {
     ...message,
     content,
+    process_content: processContent,
     role: structured.role ?? message.role,
     messageCode: message.messageCode ?? structured.messageCode,
     messageParams: message.messageParams ?? structured.messageParams,
@@ -5778,6 +5793,132 @@ function getSessionWorkspacePath(sessionId: string): string {
 
 function buildOpenClawChatSessionKey(sessionId: string, agentId: string): string {
   return sessionId.startsWith('agent:') ? sessionId : `agent:${agentId}:chat:${sessionId}`;
+}
+
+function cleanupChatProcessText(value: string): string {
+  return value
+    .replace(/\r\n?/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function findTrailingIncompleteChatProcessTagFragment(content: string, tag?: string): string {
+  const normalizedTag = tag?.trim() || '';
+  if (!content || !normalizedTag || content.endsWith(normalizedTag)) {
+    return '';
+  }
+
+  const minFragmentLength = Math.min(3, Math.max(1, normalizedTag.length - 1));
+  const maxFragmentLength = Math.min(content.length, normalizedTag.length - 1);
+
+  for (let length = maxFragmentLength; length >= minFragmentLength; length -= 1) {
+    const fragment = normalizedTag.slice(0, length);
+    if (content.endsWith(fragment)) {
+      return fragment;
+    }
+  }
+
+  return '';
+}
+
+function stripChatProcessTagArtifacts(
+  content: string,
+  processStartTag?: string,
+  processEndTag?: string,
+): string {
+  if (!content) return content;
+
+  const tags = [processStartTag?.trim(), processEndTag?.trim()]
+    .filter((tag): tag is string => Boolean(tag));
+  let cleanedContent = content.replace(/\r\n?/g, '\n');
+
+  for (const tag of tags) {
+    cleanedContent = cleanedContent.replace(new RegExp(escapeRegExpForPattern(tag), 'g'), '');
+  }
+
+  cleanedContent = cleanedContent
+    .split('\n')
+    .map((line) => {
+      let nextLine = line;
+
+      while (true) {
+        const startFragment = findTrailingIncompleteChatProcessTagFragment(nextLine, processStartTag);
+        const endFragment = findTrailingIncompleteChatProcessTagFragment(nextLine, processEndTag);
+        const fragment = startFragment.length >= endFragment.length ? startFragment : endFragment;
+
+        if (!fragment) {
+          return nextLine;
+        }
+
+        nextLine = nextLine
+          .slice(0, nextLine.length - fragment.length)
+          .replace(/[ \t]+$/g, '');
+      }
+    })
+    .join('\n');
+
+  return cleanupChatProcessText(cleanedContent);
+}
+
+function splitChatProcessOutput(
+  content: string,
+  processStartTag?: string,
+  processEndTag?: string,
+): SplitChatProcessOutputResult {
+  const normalizedContent = content.replace(/\r\n?/g, '\n');
+  const startTag = processStartTag?.trim();
+  const endTag = processEndTag?.trim();
+
+  if (!normalizedContent || !startTag || !endTag) {
+    return {
+      finalContent: stripChatProcessTagArtifacts(cleanupChatProcessText(normalizedContent), processStartTag, processEndTag),
+      processContent: '',
+      processStreaming: false,
+    };
+  }
+
+  const startPattern = escapeRegExpForPattern(startTag);
+  const endPattern = escapeRegExpForPattern(endTag);
+  const processRegex = new RegExp(`${startPattern}([\\s\\S]*?)(?:${endPattern}|$)`, 'g');
+  const processBlocks: string[] = [];
+  let processStreaming = false;
+  let match: RegExpExecArray | null;
+
+  while ((match = processRegex.exec(normalizedContent)) !== null) {
+    processBlocks.push(match[1] || '');
+    if (!match[0].endsWith(endTag)) {
+      processStreaming = true;
+    }
+  }
+
+  if (processBlocks.length === 0) {
+    return {
+      finalContent: stripChatProcessTagArtifacts(cleanupChatProcessText(normalizedContent), processStartTag, processEndTag),
+      processContent: '',
+      processStreaming: false,
+    };
+  }
+
+  const processContent = stripChatProcessTagArtifacts(
+    cleanupChatProcessText(processBlocks.join('\n\n')),
+    processStartTag,
+    processEndTag,
+  );
+  const finalContent = stripChatProcessTagArtifacts(
+    cleanupChatProcessText(
+      normalizedContent
+        .replace(processRegex, '\n\n')
+        .replace(new RegExp(`(?:${startPattern}|${endPattern})`, 'g'), '\n\n'),
+    ),
+    processStartTag,
+    processEndTag,
+  );
+
+  return {
+    finalContent,
+    processContent,
+    processStreaming,
+  };
 }
 
 function rewriteOpenClawMediaPaths(text: string, workspacePath?: string): string {
@@ -7822,8 +7963,16 @@ interface ActiveRun {
   startedAt: number;
   workspacePath: string;
   finalSessionKey: string;
+  processStartTag?: string;
+  processEndTag?: string;
   historySnapshot: ChatHistorySnapshot;
-  text: string;           // Accumulated text so far
+  rawText: string;
+  text: string;
+  modelProcessContent: string;
+  modelProcessStreaming: boolean;
+  toolProcessContent: string;
+  processContent: string;
+  processStreaming: boolean;
   clients: express.Response[]; // Active SSE clients listening to this run
   idleTimeout?: NodeJS.Timeout;
   completionProbeTimer?: NodeJS.Timeout;
@@ -7831,6 +7980,8 @@ interface ActiveRun {
   completionProbePending?: boolean;
   firstCompletionWaitResolvedAt?: number;
   visibleFinalText?: string;
+  visibleProcessContent?: string;
+  visibleProcessStreaming?: boolean;
   finalEventText?: string;
   finalEventGeneration: number;
   settledCalibrationGeneration: number;
@@ -7839,9 +7990,19 @@ interface ActiveRun {
   lastObservedHistorySignature: string;
   lastObservedHistoryActivityAt?: number;
   pendingErrorDetail?: string;
+  toolProgressLines: string[];
+  activeToolCallIds: Set<string>;
+  toolProgressById: Map<string, GroupToolProgressState>;
+  sessionEventsSubscribed?: boolean;
   clientRef?: OpenClawClient;
   cleanedUp?: boolean;
 }
+
+type SplitChatProcessOutputResult = {
+  finalContent: string;
+  processContent: string;
+  processStreaming: boolean;
+};
 
 interface PendingChatPreparation {
   sessionId: string;
@@ -8002,10 +8163,16 @@ class ActiveRunManager {
       startedAtMs: run.startedAt,
     });
     const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
-    this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
+    const rewrittenProcessContent = rewriteOpenClawMediaPaths(run.processContent || '', run.workspacePath);
+    this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
 
     run.clients.forEach((res) => {
-      res.write(`data: ${JSON.stringify({ type: 'final', text: rewritten })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        type: 'final',
+        text: rewritten,
+        process_content: rewrittenProcessContent,
+        process_streaming: false,
+      })}\n\n`);
       res.end();
     });
 
@@ -8013,20 +8180,62 @@ class ActiveRunManager {
     return { aborted: result.aborted };
   }
 
-  private emitVisibleFinal(run: ActiveRun, finalText: string, options?: { end?: boolean }) {
-    const protectedFinalText = selectPreferredTextSnapshot(run.text, finalText);
-    if (protectedFinalText) {
-      run.text = protectedFinalText;
+  private applyRawTextSnapshot(run: ActiveRun, candidateText?: string | null) {
+    const nextRawText = selectPreferredTextSnapshot(run.rawText, candidateText);
+    const rawChanged = nextRawText !== run.rawText;
+    if (rawChanged) {
+      run.rawText = nextRawText;
     }
+
+    const splitOutput = splitChatProcessOutput(run.rawText, run.processStartTag, run.processEndTag);
+    run.text = splitOutput.finalContent;
+    run.modelProcessContent = splitOutput.processContent;
+    run.modelProcessStreaming = splitOutput.processStreaming;
+    run.processContent = mergeGroupProcessContent(run.toolProcessContent, run.modelProcessContent);
+    run.processStreaming = run.modelProcessStreaming || run.activeToolCallIds.size > 0;
+    return rawChanged;
+  }
+
+  private buildVisibleChatPatch(run: ActiveRun, content: string, processContent = run.processContent, processStreaming = run.processStreaming) {
+    const rewritten = rewriteOpenClawMediaPaths(content, run.workspacePath);
+    const rewrittenProcessContent = rewriteOpenClawMediaPaths(processContent, run.workspacePath);
+    return {
+      text: rewritten,
+      process_content: rewrittenProcessContent,
+      process_streaming: processStreaming,
+    };
+  }
+
+  private emitVisibleDelta(run: ActiveRun, options?: { force?: boolean }) {
+    const visible = this.buildVisibleChatPatch(run, run.text);
+    const didVisibleChange = visible.text !== run.visibleFinalText
+      || visible.process_content !== run.visibleProcessContent
+      || visible.process_streaming !== run.visibleProcessStreaming;
+
+    if (!options?.force && !didVisibleChange) {
+      return;
+    }
+
+    run.visibleFinalText = visible.text;
+    run.visibleProcessContent = visible.process_content;
+    run.visibleProcessStreaming = visible.process_streaming;
+    run.clients.forEach(res => {
+      res.write(`data: ${JSON.stringify({ type: 'delta', ...visible })}\n\n`);
+    });
+  }
+
+  private emitVisibleFinal(run: ActiveRun, finalText: string, options?: { end?: boolean }) {
+    this.applyRawTextSnapshot(run, finalText);
     const canonicalText = options?.end
-      ? canonicalizeAssistantWorkspaceArtifacts(protectedFinalText || run.text, {
+      ? canonicalizeAssistantWorkspaceArtifacts(run.text, {
           workspacePath: run.workspacePath,
           startedAtMs: run.startedAt,
         })
-      : (protectedFinalText || run.text);
-    const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
-    const nextVisibleFinalText = selectPreferredTextSnapshot(run.visibleFinalText, rewritten);
-    if (!nextVisibleFinalText.trim()) {
+      : run.text;
+    const visible = this.buildVisibleChatPatch(run, canonicalText, run.processContent, options?.end ? false : run.processStreaming);
+    const nextVisibleFinalText = selectPreferredTextSnapshot(run.visibleFinalText, visible.text);
+    const nextVisibleProcessContent = selectPreferredTextSnapshot(run.visibleProcessContent, visible.process_content);
+    if (!nextVisibleFinalText.trim() && !nextVisibleProcessContent.trim()) {
       if (options?.end) {
         run.clients.forEach((res) => {
           res.end();
@@ -8035,11 +8244,20 @@ class ActiveRunManager {
       return '';
     }
 
-    const shouldSendFinalEvent = run.visibleFinalText !== nextVisibleFinalText;
+    const shouldSendFinalEvent = run.visibleFinalText !== nextVisibleFinalText
+      || run.visibleProcessContent !== nextVisibleProcessContent
+      || run.visibleProcessStreaming !== visible.process_streaming;
     if (shouldSendFinalEvent) {
       run.visibleFinalText = nextVisibleFinalText;
+      run.visibleProcessContent = nextVisibleProcessContent;
+      run.visibleProcessStreaming = visible.process_streaming;
       run.clients.forEach((res) => {
-        res.write(`data: ${JSON.stringify({ type: 'final', text: nextVisibleFinalText })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          type: 'final',
+          text: nextVisibleFinalText,
+          process_content: nextVisibleProcessContent,
+          process_streaming: visible.process_streaming,
+        })}\n\n`);
         if (options?.end) {
           res.end();
         }
@@ -8066,7 +8284,10 @@ class ActiveRunManager {
     workspacePath: string,
     clientRef: OpenClawClient,
     finalSessionKey: string,
-    historySnapshot: ChatHistorySnapshot
+    historySnapshot: ChatHistorySnapshot,
+    processStartTag?: string,
+    processEndTag?: string,
+    sessionEventsSubscribed = false
   ): ActiveRun {
     const run: ActiveRun = {
       sessionId,
@@ -8078,8 +8299,16 @@ class ActiveRunManager {
       startedAt: Date.now(),
       workspacePath,
       finalSessionKey,
+      processStartTag,
+      processEndTag,
       historySnapshot,
+      rawText: '',
       text: '',
+      modelProcessContent: '',
+      modelProcessStreaming: false,
+      toolProcessContent: '',
+      processContent: '',
+      processStreaming: !!(processStartTag && processEndTag),
       clients: [],
       completionProbePending: false,
       firstCompletionWaitResolvedAt: undefined,
@@ -8090,6 +8319,10 @@ class ActiveRunManager {
       lastObservedHistorySignature: historySnapshot.latestSignature,
       lastObservedHistoryActivityAt: undefined,
       pendingErrorDetail: undefined,
+      toolProgressLines: [],
+      activeToolCallIds: new Set<string>(),
+      toolProgressById: new Map<string, GroupToolProgressState>(),
+      sessionEventsSubscribed,
       clientRef
     };
     this.runs.set(sessionId, run);
@@ -8098,16 +8331,11 @@ class ActiveRunManager {
     const onDelta = (data: { sessionKey: string; runId: string; text: string }) => {
       if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
         this.resetIdleTimeout(run);
-        const nextText = selectPreferredTextSnapshot(run.text, data.text);
-        const didTextChange = nextText !== run.text;
-        run.text = nextText;
+        const didTextChange = this.applyRawTextSnapshot(run, data.text);
         if (!didTextChange) {
           return;
         }
-        const rewritten = rewriteOpenClawMediaPaths(run.text, run.workspacePath);
-        run.clients.forEach(res => {
-          res.write(`data: ${JSON.stringify({ type: 'delta', text: rewritten })}\n\n`);
-        });
+        this.emitVisibleDelta(run);
       }
     };
 
@@ -8117,12 +8345,13 @@ class ActiveRunManager {
         const terminalFinalText = resolveChatFinalTextSnapshot(data.text, data.message);
         if (terminalFinalText) {
           run.finalEventText = selectPreferredTextSnapshot(run.finalEventText, terminalFinalText);
-          run.text = selectPreferredTextSnapshot(run.text, terminalFinalText);
+          this.applyRawTextSnapshot(run, terminalFinalText);
           run.latestFinalEventAt = finalEventObservedAt;
           run.finalEventGeneration += 1;
-          this.emitVisibleFinal(run, run.finalEventText || run.text);
+          this.emitVisibleFinal(run, run.finalEventText || run.rawText);
         } else if (data.text) {
-          run.text = selectPreferredTextSnapshot(run.text, data.text);
+          this.applyRawTextSnapshot(run, data.text);
+          this.emitVisibleDelta(run);
         }
         this.resetIdleTimeout(run);
         this.scheduleCompletionProbe(run, 0);
@@ -8132,7 +8361,8 @@ class ActiveRunManager {
     const onAborted = (data: { sessionKey: string; runId: string; text: string }) => {
       if (this.matchesRunEvent(run, data.sessionKey, data.runId)) {
         if (data.text) {
-          run.text = selectPreferredTextSnapshot(run.text, data.text);
+          this.applyRawTextSnapshot(run, data.text);
+          this.emitVisibleDelta(run);
         }
         this.scheduleCompletionProbe(run, 0);
       }
@@ -8146,6 +8376,67 @@ class ActiveRunManager {
       }
     };
 
+    const onSessionTool = (payload: {
+      sessionKey?: string;
+      parentSessionKey?: string;
+      runId?: string;
+      data?: any;
+    }) => {
+      const isRelevant = payload.runId === run.runId
+        || this.matchesRunEvent(run, payload.sessionKey || '', payload.runId)
+        || payload.parentSessionKey === run.finalSessionKey;
+      if (!isRelevant) {
+        return;
+      }
+
+      const eventData = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)
+        ? payload.data as Record<string, unknown>
+        : {};
+      const toolName = typeof eventData.name === 'string' && eventData.name.trim()
+        ? eventData.name.trim()
+        : 'tool';
+      const toolCallId = typeof eventData.toolCallId === 'string' && eventData.toolCallId.trim()
+        ? eventData.toolCallId.trim()
+        : `${payload.runId || run.runId}:${toolName}`;
+      const phase = typeof eventData.phase === 'string' ? eventData.phase.trim() : '';
+      const existingState = run.toolProgressById.get(toolCallId);
+      const nextArgs = normalizeToolArgsRecord(eventData.args) ?? existingState?.args;
+      const nextState: GroupToolProgressState = existingState ?? {
+        toolName,
+        args: nextArgs,
+      };
+      nextState.toolName = toolName;
+      nextState.args = nextArgs;
+
+      const progressLocale = normalizeGroupToolProgressLocale(configManager.getConfig().language);
+      if (phase === 'start') {
+        run.activeToolCallIds.add(toolCallId);
+        appendToolProgressLine(run.toolProgressLines, formatToolStartProgress(progressLocale, toolName, nextArgs));
+      } else if (phase === 'update') {
+        run.activeToolCallIds.add(toolCallId);
+      } else if (phase === 'result') {
+        run.activeToolCallIds.delete(toolCallId);
+        appendToolProgressLine(run.toolProgressLines, formatToolResultProgress(
+          progressLocale,
+          toolName,
+          nextArgs,
+          eventData.isError === true,
+        ));
+      } else {
+        return;
+      }
+
+      run.toolProcessContent = run.toolProgressLines.join('\n');
+      if (phase === 'result') {
+        run.toolProgressById.delete(toolCallId);
+      } else {
+        run.toolProgressById.set(toolCallId, nextState);
+      }
+      this.applyRawTextSnapshot(run);
+      this.emitVisibleDelta(run, { force: true });
+      this.resetIdleTimeout(run);
+    };
+
     const onDisconnect = () => {
       onError({ sessionKey: sessionId, runId, error: CHAT_GATEWAY_DISCONNECTED_DETAIL });
     };
@@ -8154,6 +8445,7 @@ class ActiveRunManager {
     clientRef.on('chat.final', onFinal);
     clientRef.on('chat.aborted', onAborted);
     clientRef.on('chat.error', onError);
+    clientRef.on('session.tool', onSessionTool);
     clientRef.on('disconnected', onDisconnect);
 
     // Attach listeners to run for easy cleanup
@@ -8161,6 +8453,7 @@ class ActiveRunManager {
     (run as any)._onFinal = onFinal;
     (run as any)._onAborted = onAborted;
     (run as any)._onError = onError;
+    (run as any)._onSessionTool = onSessionTool;
     (run as any)._onDisconnect = onDisconnect;
 
     this.scheduleCompletionProbe(run);
@@ -8185,12 +8478,16 @@ class ActiveRunManager {
           modelUsed: run.modelUsed,
         })}\n\n`);
       }
-      if (run.visibleFinalText) {
-        res.write(`data: ${JSON.stringify({ type: 'final', text: run.visibleFinalText })}\n\n`);
-      } else if (run.text) {
-        // Immediately send current accumulated text
-        const rewritten = rewriteOpenClawMediaPaths(run.text, run.workspacePath);
-        res.write(`data: ${JSON.stringify({ type: 'delta', text: rewritten })}\n\n`);
+      if (run.visibleFinalText || run.visibleProcessContent) {
+        res.write(`data: ${JSON.stringify({
+          type: 'final',
+          text: run.visibleFinalText || '',
+          process_content: run.visibleProcessContent || '',
+          process_streaming: !!run.visibleProcessStreaming,
+        })}\n\n`);
+      } else if (run.text || run.processContent || run.processStreaming) {
+        const visible = this.buildVisibleChatPatch(run, run.text);
+        res.write(`data: ${JSON.stringify({ type: 'delta', ...visible })}\n\n`);
       }
       res.on('close', () => {
         run.clients = run.clients.filter(c => c !== res);
@@ -8207,16 +8504,18 @@ class ActiveRunManager {
         this.cleanupRun(run);
         return;
       }
-      const errorMsg = run.text ? 'Response interrupted (idle timeout).' : 'Response timed out (no connection).';
-      const finalText = run.text || errorMsg;
-      const canonicalText = canonicalizeAssistantWorkspaceArtifacts(finalText, {
+      const errorMsg = run.rawText ? 'Response interrupted (idle timeout).' : 'Response timed out (no connection).';
+      const finalText = run.rawText || errorMsg;
+      this.applyRawTextSnapshot(run, finalText);
+      const canonicalText = canonicalizeAssistantWorkspaceArtifacts(run.text, {
         workspacePath: run.workspacePath,
         startedAtMs: run.startedAt,
       });
       const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
+      const rewrittenProcessContent = rewriteOpenClawMediaPaths(run.processContent, run.workspacePath);
       
-      this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
-      this.emitVisibleFinal(run, canonicalText, { end: true });
+      this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
+      this.emitVisibleFinal(run, finalText, { end: true });
       this.cleanupRun(run);
     }, 600000); // 10 minutes
   }
@@ -8263,7 +8562,7 @@ class ActiveRunManager {
       }
       if (!this.isCurrentRun(run)) return;
 
-      let completedOutput = selectPreferredTextSnapshot(run.text, run.finalEventText);
+      let completedOutput = selectPreferredTextSnapshot(run.rawText, run.finalEventText);
       let settledErrorDetail = '';
       let shouldRetryForEmptyCompletion = false;
       let sawSettledAssistantText = false;
@@ -8428,23 +8727,24 @@ class ActiveRunManager {
   private finalizeRun(run: ActiveRun, finalText: string) {
     if (!this.isCurrentRun(run)) return;
 
-    let protectedFinalText = selectPreferredTextSnapshot(run.text, finalText);
-    protectedFinalText = selectPreferredTextSnapshot(protectedFinalText, run.finalEventText);
-    if (protectedFinalText) {
-      run.text = protectedFinalText;
-    }
-    const canonicalText = canonicalizeAssistantWorkspaceArtifacts(protectedFinalText || run.text, {
+    let protectedRawText = selectPreferredTextSnapshot(run.rawText, finalText);
+    protectedRawText = selectPreferredTextSnapshot(protectedRawText, run.finalEventText);
+    this.applyRawTextSnapshot(run, protectedRawText);
+    run.processStreaming = false;
+
+    const canonicalText = canonicalizeAssistantWorkspaceArtifacts(run.text, {
       workspacePath: run.workspacePath,
       startedAtMs: run.startedAt,
     });
     const rewritten = rewriteOpenClawMediaPaths(canonicalText, run.workspacePath);
+    const rewrittenProcessContent = rewriteOpenClawMediaPaths(run.processContent, run.workspacePath);
     if (!rewritten.trim()) {
       this.failRun(run, 'No text output returned from the run.');
       return;
     }
 
-    this.db.updateMessage(run.messageId, rewritten, run.modelUsed);
-    this.emitVisibleFinal(run, canonicalText, { end: true });
+    this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
+    this.emitVisibleFinal(run, protectedRawText, { end: true });
     this.cleanupRun(run);
   }
 
@@ -8453,13 +8753,16 @@ class ActiveRunManager {
 
     const structuredError = createStructuredChatError(detail);
 
-    this.db.updateMessage(run.messageId, structuredError.content, run.modelUsed);
+    run.processStreaming = false;
+    this.db.updateMessage(run.messageId, structuredError.content, run.modelUsed, run.processContent);
     this.db.updateMessageEnvelope(run.messageId, structuredError.role, structuredError.agent_id, structuredError.agent_name);
 
     run.clients.forEach(res => {
       res.write(`data: ${JSON.stringify({
         type: 'error',
         text: structuredError.content,
+        process_content: rewriteOpenClawMediaPaths(run.processContent, run.workspacePath),
+        process_streaming: false,
         messageCode: structuredError.messageCode,
         messageParams: structuredError.messageParams,
         rawDetail: structuredError.rawDetail,
@@ -8486,7 +8789,14 @@ class ActiveRunManager {
       if ((run as any)._onFinal) run.clientRef.off('chat.final', (run as any)._onFinal);
       if ((run as any)._onAborted) run.clientRef.off('chat.aborted', (run as any)._onAborted);
       if ((run as any)._onError) run.clientRef.off('chat.error', (run as any)._onError);
+      if ((run as any)._onSessionTool) run.clientRef.off('session.tool', (run as any)._onSessionTool);
       if ((run as any)._onDisconnect) run.clientRef.off('disconnected', (run as any)._onDisconnect);
+      if (run.sessionEventsSubscribed) {
+        run.sessionEventsSubscribed = false;
+        void run.clientRef.unsubscribeSessionEvents().catch((error) => {
+          console.warn(`[chat] Failed to unsubscribe session events for session ${run.sessionId}:`, error);
+        });
+      }
     }
     if (this.isCurrentRun(run)) {
       this.runs.delete(run.sessionId);
@@ -8767,6 +9077,8 @@ app.post('/api/chat', async (req, res) => {
   let userMsgId: number | undefined;
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
+  let sessionEventsClient: OpenClawClient | null = null;
+  let sessionEventsSubscribed = false;
 
   try {
     const rawMessage = String(message);
@@ -8889,10 +9201,17 @@ app.post('/api/chat', async (req, res) => {
     });
 
     const client = await getConnection(normalizedSessionId);
+    sessionEventsClient = client;
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
     const expectedSessionKey = buildOpenClawChatSessionKey(normalizedSessionId, agentId);
     await abortOpenClawSessionRuns(client, expectedSessionKey, `session ${normalizedSessionId} before send`);
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
+    try {
+      await client.subscribeSessionEvents();
+      sessionEventsSubscribed = true;
+    } catch (error) {
+      console.warn(`[chat] Failed to subscribe session events for session ${normalizedSessionId}:`, error);
+    }
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
@@ -8924,8 +9243,12 @@ app.post('/api/chat', async (req, res) => {
       getSessionWorkspacePath(normalizedSessionId),
       client,
       finalSessionKey,
-      preRunHistorySnapshot
+      preRunHistorySnapshot,
+      sessionInfo?.process_start_tag || undefined,
+      sessionInfo?.process_end_tag || undefined,
+      sessionEventsSubscribed
     );
+    sessionEventsSubscribed = false;
     const pendingClients = pendingChatPreparationManager.promoteClients(normalizedSessionId, sessionInterruptionEpoch);
     pendingPreparationActive = false;
     pendingClients.forEach((clientRes) => {
@@ -8933,6 +9256,12 @@ app.post('/api/chat', async (req, res) => {
     });
 
   } catch (error: any) {
+    if (sessionEventsSubscribed && sessionEventsClient) {
+      sessionEventsSubscribed = false;
+      void sessionEventsClient.unsubscribeSessionEvents().catch((unsubscribeError) => {
+        console.warn(`[chat] Failed to unsubscribe session events for session ${normalizedSessionId}:`, unsubscribeError);
+      });
+    }
     const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(normalizedSessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {
@@ -9018,6 +9347,8 @@ app.post('/api/chat/regenerate', async (req, res) => {
 
   let assistantMsgId: number | undefined;
   let pendingPreparationActive = false;
+  let sessionEventsClient: OpenClawClient | null = null;
+  let sessionEventsSubscribed = false;
 
   try {
     const requestedParentId = Number(parentId);
@@ -9124,10 +9455,17 @@ app.post('/api/chat/regenerate', async (req, res) => {
     });
 
     const client = await getConnection(sessionId);
+    sessionEventsClient = client;
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
     const expectedSessionKey = buildOpenClawChatSessionKey(sessionId, agentId);
     await abortOpenClawSessionRuns(client, expectedSessionKey, `session ${sessionId} before regenerate`);
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+    try {
+      await client.subscribeSessionEvents();
+      sessionEventsSubscribed = true;
+    } catch (error) {
+      console.warn(`[chat] Failed to subscribe session events for session ${sessionId}:`, error);
+    }
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
@@ -9158,8 +9496,12 @@ app.post('/api/chat/regenerate', async (req, res) => {
       getSessionWorkspacePath(sessionId),
       client,
       finalSessionKey,
-      preRunHistorySnapshot
+      preRunHistorySnapshot,
+      sessionInfo?.process_start_tag || undefined,
+      sessionInfo?.process_end_tag || undefined,
+      sessionEventsSubscribed
     );
+    sessionEventsSubscribed = false;
 
     const pendingClients = pendingChatPreparationManager.promoteClients(sessionId, sessionInterruptionEpoch);
     pendingPreparationActive = false;
@@ -9168,6 +9510,12 @@ app.post('/api/chat/regenerate', async (req, res) => {
     });
 
   } catch (error: any) {
+    if (sessionEventsSubscribed && sessionEventsClient) {
+      sessionEventsSubscribed = false;
+      void sessionEventsClient.unsubscribeSessionEvents().catch((unsubscribeError) => {
+        console.warn(`[chat] Failed to unsubscribe session events for session ${sessionId}:`, unsubscribeError);
+      });
+    }
     const resetInterrupted = error instanceof SessionInterruptedError || getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch;
     if (resetInterrupted) {
       if (pendingPreparationActive) {

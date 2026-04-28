@@ -1,5 +1,5 @@
 import React from 'react';
-import { Check, Copy, Trash2, RefreshCw, Quote, X, Download, ChevronDown, ChevronUp } from 'lucide-react';
+import { Check, Copy, Trash2, RefreshCw, Quote, X, Download, ChevronDown, ChevronUp, ExternalLink } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -11,6 +11,10 @@ import { getFileIconInfo } from '../../utils/fileUtils';
 
 const SEARCH_HIGHLIGHT_CLASS_NAME = 'rounded-[4px] bg-[#fff3b0] px-0.5 text-inherit';
 const EXTERNAL_LINK_CLASS_NAME = 'text-[#1a73e8] no-underline hover:underline decoration-1 underline-offset-2 break-all transition-colors hover:text-[#1557b0]';
+const HTML_PREVIEW_ROUTE_PADDING_SEGMENT = '__claw_preview_root__';
+const HTML_PREVIEW_ROUTE_PADDING_DEPTH = 24;
+const EMBED_PREVIEW_HEIGHT_SCALE = 0.5;
+const DEFAULT_EMBED_PREVIEW_HEIGHT = 210;
 
 const URL_WITH_PROTOCOL_PATTERN = /^[a-z][a-z0-9+.-]*:\/\//i;
 const URL_WITHOUT_PROTOCOL_PATTERN = /^(localhost|(?:\d{1,3}\.){3}\d{1,3}|(?:[a-z0-9-]+\.)+[a-z]{2,})(?::\d+)?(?:[/?#][^\s]*)?$/i;
@@ -260,10 +264,156 @@ export interface Attachment {
   localPath?: string;
 }
 
+const FILE_ATTACHMENT_CARD_CLASS_NAME = 'inline-flex w-full max-w-[420px] relative group/file';
+
+type EmbedPreview = {
+  url: string;
+  title: string;
+  height: number;
+};
+
 const previewableLocalPathAvailabilityCache = new Map<string, boolean>();
 
 function isPreviewableFileLink(url: string): boolean {
   return url.startsWith('/uploads/') || url.startsWith('/api/files/');
+}
+
+function isHtmlAttachmentFile(name?: string, url?: string): boolean {
+  const candidates = [name, url]
+    .map((value) => {
+      const normalized = (value || '').trim();
+      if (!normalized) return '';
+      try {
+        return decodeURIComponent(normalized);
+      } catch {
+        return normalized;
+      }
+    })
+    .filter(Boolean);
+
+  return candidates.some((value) => {
+    const pathPart = value.split(/[?#]/)[0] || '';
+    return /\.(?:html?|xhtml)$/i.test(pathPart);
+  });
+}
+
+function downloadAttachmentFile(url: string, filename: string) {
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function extractDownloadPathParam(url: string): string | null {
+  try {
+    const match = url.match(/[?&]path=([^&]+)/);
+    return match ? decodeURIComponent(match[1]) : null;
+  } catch {
+    return null;
+  }
+}
+
+function encodeBase64ForPathSegment(base64: string): string {
+  return base64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function buildHtmlAttachmentOpenUrl(url: string): string | null {
+  const previewPadding = Array.from({ length: HTML_PREVIEW_ROUTE_PADDING_DEPTH }, () => HTML_PREVIEW_ROUTE_PADDING_SEGMENT).join('/');
+  const pathParam = extractDownloadPathParam(url);
+
+  if (pathParam && url.startsWith('/api/files/download')) {
+    const decodedPath = decodeBase64Utf8(pathParam);
+    const entryFilename = decodedPath?.split('/').filter(Boolean).pop();
+    if (!entryFilename) {
+      return null;
+    }
+    return `/api/files/html-preview/path/${encodeBase64ForPathSegment(pathParam)}/${previewPadding}/${encodeURIComponent(entryFilename)}`;
+  }
+
+  if (url.startsWith('/uploads/')) {
+    const filenameInUrl = url.split('/').pop();
+    if (!filenameInUrl) {
+      return null;
+    }
+    const storedFilename = decodeURIComponent(filenameInUrl);
+    const encodedStoredFilename = encodeURIComponent(storedFilename);
+    return `/api/files/html-preview/upload/${encodedStoredFilename}/${previewPadding}/${encodedStoredFilename}`;
+  }
+
+  return null;
+}
+
+function openAttachmentFileInNewTab(url: string) {
+  window.open(buildHtmlAttachmentOpenUrl(url) || url, '_blank', 'noopener,noreferrer');
+}
+
+function getMarkdownNodePlainText(node: any): string {
+  if (!node) return '';
+  if (node.type === 'text' || node.type === 'inlineCode') {
+    return typeof node.value === 'string' ? node.value : '';
+  }
+  if (Array.isArray(node.children)) {
+    return node.children.map(getMarkdownNodePlainText).join('');
+  }
+  return '';
+}
+
+function parseEmbedAttributes(rawAttributes: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const attrRegex = /([A-Za-z_][\w-]*)=(?:"([^"]*)"|'([^']*)'|([^\s"']+))/g;
+  let match: RegExpExecArray | null;
+
+  while ((match = attrRegex.exec(rawAttributes)) !== null) {
+    attrs[match[1]] = match[2] ?? match[3] ?? match[4] ?? '';
+  }
+
+  return attrs;
+}
+
+function normalizeEmbedUrl(url: string): string {
+  const trimmed = url.trim();
+  if (!trimmed) return '';
+  if (trimmed.startsWith('/')) return trimmed;
+  return normalizeNavigableHref(trimmed) || '';
+}
+
+function parseStandaloneEmbedPreviews(text: string): EmbedPreview[] {
+  const normalized = text.trim();
+  if (!normalized) return [];
+
+  const embedRegex = /\[embed\s+([\s\S]*?)\/?\]/gi;
+  const embeds: EmbedPreview[] = [];
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = embedRegex.exec(normalized)) !== null) {
+    if (normalized.slice(cursor, match.index).trim()) {
+      return [];
+    }
+
+    const attrs = parseEmbedAttributes(match[1] || '');
+    const url = normalizeEmbedUrl(attrs.url || attrs.src || '');
+    if (!url) return [];
+
+    const requestedHeight = Number.parseInt(attrs.height || '', 10);
+    const height = Number.isFinite(requestedHeight)
+      ? Math.max(160, Math.min(Math.round(requestedHeight * EMBED_PREVIEW_HEIGHT_SCALE), 420))
+      : DEFAULT_EMBED_PREVIEW_HEIGHT;
+    embeds.push({
+      url,
+      title: (attrs.title || attrs.name || url).trim(),
+      height,
+    });
+    cursor = match.index + match[0].length;
+  }
+
+  if (embeds.length === 0 || normalized.slice(cursor).trim()) {
+    return [];
+  }
+
+  return embeds;
 }
 
 function decodeBase64Utf8(value: string): string | null {
@@ -452,6 +602,40 @@ function LocalPathAttachmentGuard({
 
   return <>{children}</>;
 }
+
+const FileAttachmentActions: React.FC<{ url: string; filename: string }> = ({ url, filename }) => {
+  const { t } = useTranslation();
+  const shouldShowOpenInNewTab = isHtmlAttachmentFile(filename, url);
+
+  return (
+    <div className="absolute right-3 top-1/2 flex -translate-y-1/2 items-center gap-1">
+      {shouldShowOpenInNewTab ? (
+        <button
+          type="button"
+          className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-gray-200 bg-gray-50 text-gray-400 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600"
+          onClick={(event) => {
+            event.stopPropagation();
+            openAttachmentFileInNewTab(url);
+          }}
+          title={t('common.openInNewTab')}
+        >
+          <ExternalLink className="h-4 w-4" />
+        </button>
+      ) : null}
+      <button
+        type="button"
+        className="inline-flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-gray-200 bg-gray-50 text-gray-400 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600"
+        onClick={(event) => {
+          event.stopPropagation();
+          downloadAttachmentFile(url, filename);
+        }}
+        title={t('common.downloadFile')}
+      >
+        <Download className="h-4 w-4" />
+      </button>
+    </div>
+  );
+};
 
 function createStableContentKey(value: string): string {
   let hash = 0;
@@ -803,7 +987,7 @@ export const ProcessStepBlock = ({
   const sanitizedProcessContent = sanitizeConfiguredProcessText(content, processStartTag, processEndTag);
   const normalizedContent = normalizeProcessPreviewablePathLines(sanitizedProcessContent.content);
   const shouldRenderInlineExecutingPlaceholder = Boolean(
-    isExtractingProcess && sanitizedProcessContent.hasTrailingPlaceholder
+    isExtractingProcess && (!normalizedContent.trim() || sanitizedProcessContent.hasTrailingPlaceholder)
   );
 
   React.useEffect(() => {
@@ -852,15 +1036,17 @@ export const ProcessStepBlock = ({
             </a>
           ) : (
             (() => {
-              const { Icon, typeText, bgColor } = getFileIconInfo(att.name || t('common.file'));
+              const fileName = att.name || t('common.file');
+              const isHtmlFile = isHtmlAttachmentFile(fileName, att.url);
+              const { Icon, typeText, bgColor } = getFileIconInfo(fileName);
               return (
-                <div className="inline-flex w-[260px] relative group/file">
+                <div className={FILE_ATTACHMENT_CARD_CLASS_NAME}>
                   <div
                     className="flex items-center gap-3 p-2.5 rounded-xl border border-gray-300 bg-white hover:bg-[#fffdf0] hover:border-orange-300 cursor-pointer transition-all w-full"
                     onClick={(event) => {
                       if (onPreview) {
                         event.preventDefault();
-                        onPreview(att.url, att.name || t('common.file'));
+                        onPreview(att.url, fileName);
                       } else {
                         window.open(att.url, '_blank');
                       }
@@ -869,27 +1055,13 @@ export const ProcessStepBlock = ({
                     <div className={`w-10 h-10 rounded-lg ${bgColor} flex items-center justify-center flex-shrink-0 border border-gray-100`}>
                       <Icon className="w-5 h-5 text-white" />
                     </div>
-                    <div className="flex flex-col min-w-0 pr-8 w-full relative">
+                    <div className={`flex flex-col min-w-0 ${isHtmlFile ? 'pr-20' : 'pr-12'} w-full relative`}>
                       <div className="text-[13px] font-bold text-gray-800 truncate transition-colors w-full leading-snug">
-                        {renderSearchHighlighted(att.name || t('common.file'), `attachment-name-${index}`)}
+                        {renderSearchHighlighted(fileName, `attachment-name-${index}`)}
                       </div>
                       <span className="text-[11px] text-gray-400 font-medium mt-0.5">{typeText}</span>
                     </div>
-                    <div
-                      className="absolute right-3 bg-gray-50 p-1.5 rounded-md border border-gray-200 cursor-pointer hover:bg-blue-50 hover:border-blue-200 transition-colors group/dl"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        const link = document.createElement('a');
-                        link.href = att.url;
-                        link.download = att.name || t('common.file');
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                      }}
-                      title={t('common.downloadFile')}
-                    >
-                      <Download className="w-4 h-4 text-gray-400 group-hover/dl:text-blue-600" />
-                    </div>
+                    <FileAttachmentActions url={att.url} filename={fileName} />
                   </div>
                 </div>
               );
@@ -928,6 +1100,17 @@ export const ProcessStepBlock = ({
       return <pre {...props}>{children}</pre>;
     },
     p(props: any) {
+      const embedPreviews = parseStandaloneEmbedPreviews(getMarkdownNodePlainText(props.node));
+      if (embedPreviews.length > 0) {
+        return (
+          <div className="w-full">
+            {embedPreviews.map((embed, index) => (
+              <EmbedPreviewCard key={`${embed.url}-${index}`} embed={embed} />
+            ))}
+          </div>
+        );
+      }
+
       const nodes = props.node?.children || [];
       const isAttachmentBlock = nodes.length > 0 && nodes.every(
         (child: any) =>
@@ -1254,6 +1437,37 @@ const QuoteBlock: React.FC<{ author: string; time: string; content: string; comp
   );
 };
 
+const EmbedPreviewCard: React.FC<{ embed: EmbedPreview }> = ({ embed }) => {
+  const { t } = useTranslation();
+
+  return (
+    <div className="not-prose my-4 w-full max-w-[900px] overflow-hidden rounded-lg border border-gray-300 bg-white">
+      <div className="flex items-center gap-3 border-b border-gray-200 bg-gray-50 px-3 py-2">
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[13px] font-semibold text-gray-800">{embed.title}</div>
+          <div className="truncate text-[11px] text-gray-500">{embed.url}</div>
+        </div>
+        <a
+          href={embed.url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-md border border-gray-200 bg-white text-gray-500 transition-colors hover:border-blue-200 hover:bg-blue-50 hover:text-blue-600"
+          title={t('common.preview')}
+        >
+          <ExternalLink className="h-4 w-4" />
+        </a>
+      </div>
+      <iframe
+        src={embed.url}
+        title={embed.title}
+        className="block w-full border-0 bg-white"
+        style={{ height: embed.height }}
+        sandbox="allow-same-origin allow-scripts allow-forms allow-popups allow-downloads"
+      />
+    </div>
+  );
+};
+
 export const normalizeProcessBlocks = (content: string, processStartTag?: string, processEndTag?: string) => {
   if (!content || !processStartTag || !processEndTag) return content;
 
@@ -1429,15 +1643,17 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
             </a>
           ) : (
             (() => {
-              const { Icon, typeText, bgColor } = getFileIconInfo(att.name || t('common.file'));
+              const fileName = att.name || t('common.file');
+              const isHtmlFile = isHtmlAttachmentFile(fileName, att.url);
+              const { Icon, typeText, bgColor } = getFileIconInfo(fileName);
               return (
-                <div className="inline-flex w-[260px] relative group/file">
+                <div className={FILE_ATTACHMENT_CARD_CLASS_NAME}>
                   <div
                     className="flex items-center gap-3 p-2.5 rounded-xl border border-gray-300 bg-white hover:bg-[#fffdf0] hover:border-orange-300 cursor-pointer transition-all w-full"
                     onClick={(event) => {
                       if (onPreview) {
                         event.preventDefault();
-                        onPreview(att.url, att.name || t('common.file'));
+                        onPreview(att.url, fileName);
                       } else {
                         window.open(att.url, '_blank');
                       }
@@ -1446,27 +1662,13 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                     <div className={`w-10 h-10 rounded-lg ${bgColor} flex items-center justify-center flex-shrink-0 border border-gray-100`}>
                       <Icon className="w-5 h-5 text-white" />
                     </div>
-                    <div className="flex flex-col min-w-0 pr-8 w-full relative">
+                    <div className={`flex flex-col min-w-0 ${isHtmlFile ? 'pr-20' : 'pr-12'} w-full relative`}>
                       <div className="text-[13px] font-bold text-gray-800 truncate transition-colors w-full leading-snug">
-                        {att.name || t('common.file')}
+                        {fileName}
                       </div>
                       <span className="text-[11px] text-gray-400 font-medium mt-0.5">{typeText}</span>
                     </div>
-                    <div
-                      className="absolute right-3 bg-gray-50 p-1.5 rounded-md border border-gray-200 cursor-pointer hover:bg-blue-50 hover:border-blue-200 transition-colors group/dl"
-                      onClick={(event) => {
-                        event.stopPropagation();
-                        const link = document.createElement('a');
-                        link.href = att.url;
-                        link.download = att.name || t('common.file');
-                        document.body.appendChild(link);
-                        link.click();
-                        document.body.removeChild(link);
-                      }}
-                      title={t('common.downloadFile')}
-                    >
-                      <Download className="w-4 h-4 text-gray-400 group-hover/dl:text-blue-600" />
-                    </div>
+                    <FileAttachmentActions url={att.url} filename={fileName} />
                   </div>
                 </div>
               );
@@ -1672,14 +1874,16 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                             </a>
                           ) : (
                             (() => {
-                              const { Icon, typeText, bgColor } = getFileIconInfo(att.name || t('common.file'));
+                              const fileName = att.name || t('common.file');
+                              const isHtmlFile = isHtmlAttachmentFile(fileName, att.url);
+                              const { Icon, typeText, bgColor } = getFileIconInfo(fileName);
                               return (
-                                <div key={i} className="inline-flex w-[260px] relative group/file">
+                                <div key={i} className={FILE_ATTACHMENT_CARD_CLASS_NAME}>
                                   <div className="flex items-center gap-3 p-2.5 rounded-xl border border-gray-200 bg-white hover:bg-[#fffdf0] hover:border-orange-300 cursor-pointer transition-all w-full"
                                        onClick={(e) => {
                                           if (onPreview) {
                                              e.preventDefault();
-                                             onPreview(att.url, att.name || t('common.file'));
+                                             onPreview(att.url, fileName);
                                           } else {
                                              window.open(att.url, '_blank');
                                           }
@@ -1687,26 +1891,13 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                                     <div className={`w-10 h-10 rounded-lg ${bgColor} flex items-center justify-center flex-shrink-0 border border-gray-100`}>
                                       <Icon className="w-5 h-5 text-white" />
                                     </div>
-                                    <div className="flex flex-col min-w-0 pr-8 w-full relative">
+                                    <div className={`flex flex-col min-w-0 ${isHtmlFile ? 'pr-20' : 'pr-12'} w-full relative`}>
                                       <div className="text-[13px] font-bold text-gray-800 truncate transition-colors w-full leading-snug">
-                                        {att.name || t('common.file')}
+                                        {fileName}
                                       </div>
                                       <span className="text-[11px] text-gray-400 font-medium mt-0.5">{typeText}</span>
                                     </div>
-                                    <div className="absolute right-3 bg-gray-50 p-1.5 rounded-md border border-gray-200 cursor-pointer hover:bg-blue-50 hover:border-blue-200 transition-colors group/dl"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        const link = document.createElement('a');
-                                        link.href = att.url;
-                                        link.download = att.name || t('common.file');
-                                        document.body.appendChild(link);
-                                        link.click();
-                                        document.body.removeChild(link);
-                                      }}
-                                      title={t('common.downloadFile')}
-                                    >
-                                      <Download className="w-4 h-4 text-gray-400 group-hover/dl:text-blue-600" />
-                                    </div>
+                                    <FileAttachmentActions url={att.url} filename={fileName} />
                                   </div>
                                 </div>
                               );
@@ -1968,9 +2159,10 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                         if (props.href?.startsWith('/uploads/') || props.href?.startsWith('/api/files/')) {
                           const nodes = Array.isArray(props.children) ? props.children : [props.children];
                           const fileName = nodes.map((n: any) => String(n)).join('') || t('common.file');
+                          const isHtmlFile = isHtmlAttachmentFile(fileName, props.href);
                           const { Icon, typeText, bgColor } = getFileIconInfo(fileName);
                           return (
-                            <div className="inline-flex w-[260px] mr-3 mb-3 relative group/file">
+                            <div className={`${FILE_ATTACHMENT_CARD_CLASS_NAME} mr-3 mb-3`}>
                               <div className="flex items-center gap-3 p-2.5 rounded-xl border border-gray-200 bg-white hover:bg-[#fffdf0] hover:border-orange-300 cursor-pointer transition-all w-full"
                                    onClick={(e) => {
                                       if (onPreview) {
@@ -1983,26 +2175,13 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                                 <div className={`w-10 h-10 rounded-lg ${bgColor} flex items-center justify-center flex-shrink-0 border border-gray-100`}>
                                   <Icon className="w-5 h-5 text-white" />
                                 </div>
-                                <div className="flex flex-col min-w-0 pr-8 w-full relative">
+                                <div className={`flex flex-col min-w-0 ${isHtmlFile ? 'pr-20' : 'pr-12'} w-full relative`}>
                                   <div className="text-[13px] font-bold text-gray-800 truncate transition-colors w-full leading-snug">
                                     {fileName}
                                   </div>
                                   <span className="text-[11px] text-gray-400 font-medium mt-0.5">{typeText}</span>
                                 </div>
-                                <div className="absolute right-3 bg-gray-50 p-1.5 rounded-md border border-gray-200 cursor-pointer hover:bg-blue-50 hover:border-blue-200 transition-colors group/dl"
-                                  onClick={(e) => {
-                                    e.stopPropagation();
-                                    const link = document.createElement('a');
-                                    link.href = props.href;
-                                    link.download = fileName;
-                                    document.body.appendChild(link);
-                                    link.click();
-                                    document.body.removeChild(link);
-                                  }}
-                                  title={t('common.downloadFile')}
-                                >
-                                  <Download className="w-4 h-4 text-gray-400 group-hover/dl:text-blue-600" />
-                                </div>
+                                <FileAttachmentActions url={props.href} filename={fileName} />
                               </div>
                             </div>
                           );
@@ -2039,6 +2218,17 @@ const MessageBubbleInner: React.FC<MessageProps> = ({
                         return <h6 {...props}>{renderSearchHighlighted(props.children, 'h6')}</h6>;
                       },
                       p(props: any) {
+                        const embedPreviews = parseStandaloneEmbedPreviews(getMarkdownNodePlainText(props.node));
+                        if (embedPreviews.length > 0) {
+                          return (
+                            <div className="w-full">
+                              {embedPreviews.map((embed, index) => (
+                                <EmbedPreviewCard key={`${embed.url}-${index}`} embed={embed} />
+                              ))}
+                            </div>
+                          );
+                        }
+
                         const nodes = props.node?.children || [];
                         const isAttachmentBlock = nodes.length > 0 && nodes.every(
                           (child: any) => 
