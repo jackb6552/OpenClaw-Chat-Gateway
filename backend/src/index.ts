@@ -65,6 +65,7 @@ import {
   extractSettledAssistantOutcome,
   getHistoryTailActivity,
   getHistorySnapshot,
+  getUnknownHistorySnapshot,
   isNonTerminalAssistantMessage,
   shouldPreferSettledAssistantText,
 } from './chat-history-reconciliation';
@@ -8890,19 +8891,6 @@ function resolveChatFinalTextSnapshot(text: string, message: any): string {
   return selectPreferredTextSnapshot(text, extractOpenClawMessageText(message));
 }
 
-function buildLocalChatHistorySnapshot(sessionId: string): ChatHistorySnapshot {
-  const messages = db.getMessages(sessionId, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
-    .filter((message) => message.role === 'user' || message.role === 'assistant')
-    .map((message) => ({
-      role: message.role,
-      content: message.content,
-      timestamp: message.created_at,
-      stopReason: message.role === 'assistant' && message.content.trim() ? 'stop' : undefined,
-    }));
-
-  return getHistorySnapshot({ messages });
-}
-
 function warmManagedHostToolingInBackground() {
   void ensureManagedLocalAudioRuntimeReady().catch((error) => {
     console.error('Failed to prepare managed local audio transcription runtime:', error);
@@ -9452,17 +9440,6 @@ class ActiveRunManager {
     const pendingErrorDetail = normalizeCliText(run.pendingErrorDetail) || '';
 
     try {
-      const terminalFinalEventText = run.finalEventText?.trim() ? run.finalEventText : '';
-      if (terminalFinalEventText && run.latestFinalEventAt !== undefined) {
-        const remainingSettleMs = run.latestFinalEventAt + CHAT_FINAL_EVENT_SETTLE_GRACE_MS - Date.now();
-        if (remainingSettleMs > 0) {
-          this.scheduleCompletionProbe(run, remainingSettleMs);
-          return;
-        }
-        this.finalizeRun(run, terminalFinalEventText);
-        return;
-      }
-
       await run.clientRef.waitForRun(run.runId, CHAT_STREAM_COMPLETION_WAIT_TIMEOUT_MS);
       if (run.firstCompletionWaitResolvedAt === undefined) {
         run.firstCompletionWaitResolvedAt = Date.now();
@@ -10111,7 +10088,6 @@ app.post('/api/chat', async (req, res) => {
       finalParentId = history.length > 0 ? history[history.length - 1].id : undefined;
     }
 
-    const preRunHistorySnapshot = buildLocalChatHistorySnapshot(normalizedSessionId);
     userMsgId = Number(db.saveMessage({ session_key: normalizedSessionId, parent_id: finalParentId, role: 'user', content: rawMessage }));
 
     assistantMsgId = Number(db.saveMessage({
@@ -10196,6 +10172,11 @@ app.post('/api/chat', async (req, res) => {
       console.warn(`[chat] Failed to subscribe session events for session ${normalizedSessionId}:`, error);
     }
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
+    assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
+
+    const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
+      .then((history) => getHistorySnapshot(history))
+      .catch(() => getUnknownHistorySnapshot());
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
@@ -10368,7 +10349,6 @@ app.post('/api/chat/regenerate', async (req, res) => {
       db.deleteMessage(Number(latestReplyMessage.id));
     }
 
-    const preRunHistorySnapshot = buildLocalChatHistorySnapshot(sessionId);
     const sessionInfo = sessionManager.getSession(sessionId);
     const rawMessage = String(message);
     let finalMessage = rawMessage;
@@ -10481,6 +10461,11 @@ app.post('/api/chat/regenerate', async (req, res) => {
       console.warn(`[chat] Failed to subscribe session events for session ${sessionId}:`, error);
     }
     const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
+    assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
+
+    const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
+      .then((history) => getHistorySnapshot(history))
+      .catch(() => getUnknownHistorySnapshot());
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
 
     const { runId, sessionKey: finalSessionKey } = await client.sendChatMessageStreaming({
