@@ -7,6 +7,7 @@ import {
 export type ChatHistorySnapshot = {
   length: number;
   latestSignature: string;
+  messageSignatures?: string[];
 };
 
 export type SettledAssistantOutcome =
@@ -140,6 +141,7 @@ export function getHistorySnapshot(historyPayload: any): ChatHistorySnapshot {
   return {
     length: messages.length,
     latestSignature: createHistoryMessageSignature(latestMessage),
+    messageSignatures: messages.map((message: any) => createHistoryMessageSignature(message)).filter(Boolean),
   };
 }
 
@@ -177,9 +179,15 @@ export function extractSettledAssistantOutcomeRecord(historyPayload: any, baseli
     return { kind: 'none', timestampMs: null };
   }
 
+  const baselineSignatures = new Set((baseline.messageSignatures || []).filter(Boolean));
+  if (baseline.latestSignature) {
+    baselineSignatures.add(baseline.latestSignature);
+  }
+
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
-    if (baseline.latestSignature && createHistoryMessageSignature(message) === baseline.latestSignature) {
+    const signature = createHistoryMessageSignature(message);
+    if (baselineSignatures.has(signature)) {
       break;
     }
 
