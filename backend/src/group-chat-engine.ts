@@ -36,7 +36,7 @@ import { rewriteVisibleFileLinks } from './file-link-rewrite';
 import { getGroupRuntimeSessionKey } from './group-workspace';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
 import { canonicalizeAssistantWorkspaceArtifacts } from './workspace-artifact-rewrite';
-import { isLikelyImageGenerationPrompt } from './image-generation-routing';
+import { shouldUseConfiguredImageGenerationModel } from './image-generation-routing';
 
 const DEFAULT_MAX_CHAIN_DEPTH = 6;
 const GROUP_STREAM_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -467,14 +467,6 @@ export function appendToolProgressLine(lines: string[], line: string): boolean {
     lines.splice(0, lines.length - GROUP_TOOL_PROGRESS_MAX_LINES);
   }
   return true;
-}
-
-export function mergeGroupProcessContent(...sections: Array<string | null | undefined>): string {
-  return sections
-    .map((section) => normalizeGroupPromptText(section || ''))
-    .filter(Boolean)
-    .join('\n\n')
-    .trim();
 }
 
 function resolveConfiguredProcessTagPair(
@@ -1449,7 +1441,7 @@ export class GroupChatEngine extends EventEmitter {
       const promptInput = [rewrittenTrigger.text, imageInspectionContext, documentToolingContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim();
 
       const imageIntentContext = runtimeContext.bootstrapContext || '';
-      const imageGenerationStartProcessContent = !isResetCommand && isLikelyImageGenerationPrompt(triggerMsg, imageIntentContext)
+      const imageGenerationStartProcessContent = !isResetCommand && shouldUseConfiguredImageGenerationModel(triggerMsg, imageIntentContext)
         ? this.buildImageGenerationStartProcessContent?.()
         : null;
       if (imageGenerationStartProcessContent && msgId !== undefined) {
@@ -1621,7 +1613,7 @@ export class GroupChatEngine extends EventEmitter {
         };
 
         const syncCombinedProcessState = () => {
-          const combinedProcessOutput = mergeGroupProcessContent(toolProcessOutput, processOutput);
+          const combinedProcessOutput = toolProcessOutput;
           const combinedProcessStreaming = modelProcessStreaming || activeToolCallIds.size > 0;
           latestProcessOutput = combinedProcessOutput;
           this.updateActiveRunOutput(groupId, runId, {
@@ -2082,7 +2074,7 @@ export class GroupChatEngine extends EventEmitter {
         workspacePath: runtimeContext.workspacePath,
         startedAtMs: runStartedAt,
       });
-      let canonicalProcessContent = selectPreferredTextSnapshot(latestProcessOutput, splitProtectedResponse.processContent);
+      let canonicalProcessContent = latestProcessOutput;
       if (!canonicalResponse.trim()) {
         const canonicalFallbackResponse = canonicalizeAssistantWorkspaceArtifacts(splitProtectedResponse.processContent, {
           workspacePath: runtimeContext.workspacePath,
@@ -2090,7 +2082,6 @@ export class GroupChatEngine extends EventEmitter {
         });
         if (canonicalFallbackResponse.trim()) {
           canonicalResponse = canonicalFallbackResponse;
-          canonicalProcessContent = '';
         }
       }
       latestProcessOutput = canonicalProcessContent;

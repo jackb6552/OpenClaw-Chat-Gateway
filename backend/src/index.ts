@@ -20,7 +20,6 @@ import {
   formatToolResultProgress,
   formatToolStartProgress,
   getStructuredGroupMessage,
-  mergeGroupProcessContent,
   normalizeGroupToolProgressLocale,
   normalizeToolArgsRecord,
   type GroupToolProgressState,
@@ -71,7 +70,7 @@ import {
 } from './chat-history-reconciliation';
 import { selectPreferredTextSnapshot } from './text-snapshot-protection';
 import { getCurrentAppVersionInfo, getLatestVersionInfo, type LatestVersionInfo as AppLatestVersionInfo } from './app-version';
-import { isLikelyImageGenerationPrompt } from './image-generation-routing';
+import { shouldUseConfiguredImageGenerationModel } from './image-generation-routing';
 import { readAgentBootstrapContextFromWorkspace } from './agent-bootstrap-context';
 
 const execPromise = util.promisify(exec);
@@ -2523,7 +2522,7 @@ async function tryGenerateImageForPrompt(params: {
   }
 
   const intentText = normalizeCliText(params.intentText) || params.prompt;
-  if (!isLikelyImageGenerationPrompt(intentText, params.intentContext)) {
+  if (!shouldUseConfiguredImageGenerationModel(intentText, params.intentContext)) {
     return null;
   }
 
@@ -9105,7 +9104,7 @@ class ActiveRunManager {
     run.text = splitOutput.finalContent;
     run.modelProcessContent = splitOutput.processContent;
     run.modelProcessStreaming = splitOutput.processStreaming;
-    run.processContent = mergeGroupProcessContent(run.toolProcessContent, run.modelProcessContent);
+    run.processContent = run.toolProcessContent;
     run.processStreaming = run.modelProcessStreaming || run.activeToolCallIds.size > 0;
     return rawChanged;
   }
@@ -10058,7 +10057,7 @@ app.post('/api/chat', async (req, res) => {
     const character = allCharacters.find(c => c.agentId === agentId);
     const agentName = sessionInfo?.name || character?.name || agentId;
     const imageIntentContext = readAgentBootstrapIntentContext(agentId);
-    const directImageModel = isLikelyImageGenerationPrompt(rawMessage, imageIntentContext)
+    const directImageModel = shouldUseConfiguredImageGenerationModel(rawMessage, imageIntentContext)
       ? getConfiguredDirectImageGenerationModel()
       : null;
     const modelUsed = directImageModel || agentProvisioner.readAgentModel(agentId) ||
@@ -10414,7 +10413,7 @@ app.post('/api/chat/regenerate', async (req, res) => {
     const character = allCharacters.find(c => c.agentId === agentId);
     const agentName = sessionInfo?.name || character?.name || agentId;
     const imageIntentContext = readAgentBootstrapIntentContext(agentId);
-    const directImageModel = isLikelyImageGenerationPrompt(rawMessage, imageIntentContext)
+    const directImageModel = shouldUseConfiguredImageGenerationModel(rawMessage, imageIntentContext)
       ? getConfiguredDirectImageGenerationModel()
       : null;
     const modelUsed = directImageModel || agentProvisioner.readAgentModel(agentId) ||

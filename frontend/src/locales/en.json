@@ -499,7 +499,7 @@
     "defaultModelEmpty": "No models available to select",
     "defaultModelNoSelection": "Please select a default primary model",
     "imageGenerationTitle": "Image Model",
-    "imageGenerationDescription": "Select an image generation model from models already added under existing endpoints; drawing requests call that endpoint directly with its baseUrl and key.",
+    "imageGenerationDescription": "Select an image generation model from models already added under existing endpoints; ClawUI uses that endpoint only when an agent's startup .md explicitly declares default image generation.",
     "imageGenerationPlaceholder": "Select an image generation model",
     "imageGenerationEmpty": "No existing endpoint models are marked for image generation. Test and add one from Add Model first.",
     "imageGenerationOpenClawDefaultHint": "When no model is specified, drawing requests continue through the text model.",

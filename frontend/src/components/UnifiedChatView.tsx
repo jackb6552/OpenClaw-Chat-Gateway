@@ -342,13 +342,20 @@ function shouldPreferIncomingMessageContent(
   return normalizedNext.length > normalizedCurrent.length;
 }
 
-function shouldPreferIncomingSupplementalContent(currentValue: string | undefined, nextValue: string | undefined): boolean {
+function shouldPreferIncomingSupplementalContent(
+  currentValue: string | undefined,
+  nextValue: string | undefined,
+  options?: { allowShorterReplacement?: boolean },
+): boolean {
   const currentContent = typeof currentValue === 'string' ? currentValue : '';
   const nextContent = typeof nextValue === 'string' ? nextValue : '';
   const normalizedCurrent = currentContent.trim();
   const normalizedNext = nextContent.trim();
 
   if (!normalizedNext) {
+    if (options?.allowShorterReplacement) {
+      return true;
+    }
     return !normalizedCurrent;
   }
 
@@ -369,10 +376,16 @@ function shouldPreferIncomingSupplementalContent(currentValue: string | undefine
   }
 
   if (normalizedCurrent.startsWith(normalizedNext)) {
-    return false;
+    return !!options?.allowShorterReplacement;
   }
 
   return normalizedNext.length > normalizedCurrent.length;
+}
+
+function shouldAllowTerminalProcessContentReplacement(incoming: Partial<ChatMessage>): boolean {
+  return hasOwnMessageField(incoming, 'processContent')
+    && hasOwnMessageField(incoming, 'processStreaming')
+    && incoming.processStreaming === false;
 }
 
 function mergeMessagePreservingContent(existing: ChatMessage, incoming: Partial<ChatMessage>): ChatMessage {
@@ -380,7 +393,11 @@ function mergeMessagePreservingContent(existing: ChatMessage, incoming: Partial<
   if (hasOwnMessageField(incoming, 'content') && !shouldPreferIncomingMessageContent(existing, incoming)) {
     next.content = existing.content;
   }
-  if (hasOwnMessageField(incoming, 'processContent') && !shouldPreferIncomingSupplementalContent(existing.processContent, incoming.processContent)) {
+  if (hasOwnMessageField(incoming, 'processContent') && !shouldPreferIncomingSupplementalContent(
+    existing.processContent,
+    incoming.processContent,
+    { allowShorterReplacement: shouldAllowTerminalProcessContentReplacement(incoming) },
+  )) {
     next.processContent = existing.processContent;
   }
   return next;
@@ -401,6 +418,7 @@ function mergeMessagePatchPreservingContent(
   if (hasOwnMessageField(incomingPatch, 'processContent') && !shouldPreferIncomingSupplementalContent(
     typeof existingPatch.processContent === 'string' ? existingPatch.processContent : '',
     incomingPatch.processContent,
+    { allowShorterReplacement: shouldAllowTerminalProcessContentReplacement(incomingPatch) },
   )) {
     next.processContent = existingPatch.processContent;
   }

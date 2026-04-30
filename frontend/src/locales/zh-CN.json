@@ -499,7 +499,7 @@
     "defaultModelEmpty": "没有可选择的模型",
     "defaultModelNoSelection": "请选择默认主模型",
     "imageGenerationTitle": "图像模型",
-    "imageGenerationDescription": "从已添加的端点模型中选择图像生成模型；绘画请求会直接使用该端点的 baseUrl 和 key 调用。",
+    "imageGenerationDescription": "从已添加的端点模型中选择图像生成模型；仅当智能体启动 .md 明确要求默认绘图时，ClawUI 才会用该端点执行图像生成。",
     "imageGenerationPlaceholder": "选择支持图像生成的模型",
     "imageGenerationEmpty": "已有端点中没有标记为图像生成的模型，请先在添加模型时检测并添加。",
     "imageGenerationOpenClawDefaultHint": "未单独指定时，绘画请求将继续按文本模型处理。",
