@@ -813,6 +813,7 @@ export class GroupChatEngine extends EventEmitter {
       outputPath: string;
       bootstrapContext?: string;
   }>;
+  private canUseHostTakeover: (agentId: string) => boolean;
   private tryGenerateImageForPrompt?: GroupDirectImageGenerationHandler;
   private buildImageGenerationStartProcessContent?: GroupDirectImageGenerationStartProcessBuilder;
   private pendingRuns = new Map<string, PendingGroupRun>();
@@ -831,7 +832,8 @@ export class GroupChatEngine extends EventEmitter {
       bootstrapContext?: string;
     }>,
     tryGenerateImageForPrompt?: GroupDirectImageGenerationHandler,
-    buildImageGenerationStartProcessContent?: GroupDirectImageGenerationStartProcessBuilder
+    buildImageGenerationStartProcessContent?: GroupDirectImageGenerationStartProcessBuilder,
+    canUseHostTakeover?: (agentId: string) => boolean,
   ) {
     super();
     this.db = db;
@@ -841,6 +843,7 @@ export class GroupChatEngine extends EventEmitter {
     this.prepareGroupRuntime = prepareGroupRuntime;
     this.tryGenerateImageForPrompt = tryGenerateImageForPrompt;
     this.buildImageGenerationStartProcessContent = buildImageGenerationStartProcessContent;
+    this.canUseHostTakeover = canUseHostTakeover || (() => isGroupHostTakeoverEnabled());
   }
 
   private emitRunState(groupId: string) {
@@ -1137,7 +1140,7 @@ export class GroupChatEngine extends EventEmitter {
       parts.push(groupDesc);
     }
 
-    if (isGroupHostTakeoverEnabled()) {
+    if (this.canUseHostTakeover(member.agent_id)) {
       parts.push(buildGroupHostTakeoverPrompt());
     }
 
@@ -1418,7 +1421,8 @@ export class GroupChatEngine extends EventEmitter {
       const rewrittenTrigger = isResetCommand
         ? { text: triggerMsg, attachments: [] as MessageAttachment[], linkedUploads: [] as WorkspaceUploadLink[] }
         : rewriteMessageWithWorkspaceUploads(triggerMsg, runtimeContext.uploadsPath, { extractImageAttachments: true });
-      if (!isResetCommand && isGroupHostTakeoverEnabled() && hasDocumentUploads(rewrittenTrigger.linkedUploads)) {
+      const canUseHostTakeover = this.canUseHostTakeover(agentId);
+      if (!isResetCommand && canUseHostTakeover && hasDocumentUploads(rewrittenTrigger.linkedUploads)) {
         try {
           await ensureManagedDocumentToolingReady();
         } catch (error) {
@@ -1431,7 +1435,7 @@ export class GroupChatEngine extends EventEmitter {
         : buildImageUploadInspectionContext(rewrittenTrigger.linkedUploads);
       const documentToolingContext = isResetCommand
         ? ''
-        : buildDocumentToolingContext(rewrittenTrigger.linkedUploads);
+        : (canUseHostTakeover ? buildDocumentToolingContext(rewrittenTrigger.linkedUploads) : '');
       const audioTranscriptContext = isResetCommand
         ? ''
         : buildAudioTranscriptContext(

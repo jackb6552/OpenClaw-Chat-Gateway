@@ -38,6 +38,20 @@ type GroupSummary = {
 
 type SidebarListTab = 'agents' | 'groups' | 'favorites';
 type SidebarFavoriteType = 'agents' | 'groups';
+type AgentRuntimeMode = 'configured' | 'direct';
+type AgentSystemPromptMode = 'system' | 'agent';
+type AgentToolMode = 'full' | 'coding' | 'messaging' | 'minimal' | 'off';
+type AgentRuntimeMetrics = {
+  systemPrompt?: {
+    systemChars?: number | null;
+    agentChars?: number | null;
+  };
+  tools?: {
+    charsByMode?: Partial<Record<AgentToolMode, number | null>>;
+  };
+};
+type AgentEditorTab = 'soul' | 'user' | 'agents' | 'tools' | 'heartbeat' | 'identity';
+type AgentEditorContentKey = 'soulContent' | 'userContent' | 'agentsContent' | 'toolsContent' | 'heartbeatContent' | 'identityContent';
 type SidebarFavorites = {
   agents: string[];
   groups: string[];
@@ -53,6 +67,14 @@ const MODAL_FIELD_LABEL_CLASS = 'block text-sm font-semibold text-gray-700 mb-1.
 const MODAL_TEXT_INPUT_CLASS = 'w-full px-4 py-2.5 bg-gray-50 border border-gray-200 rounded-xl text-[15px] text-gray-900 placeholder:text-gray-400 outline-none transition-all focus:bg-white focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 const MODAL_TEXTAREA_CLASS = 'w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl text-[15px] text-gray-900 placeholder:text-gray-400 outline-none transition-all resize-none focus:bg-white focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500';
 const MODAL_EDITOR_TEXTAREA_CLASS = 'w-full h-36 p-4 bg-transparent outline-none transition-all resize-none text-[15px] text-gray-900 border-0 focus:ring-0 leading-relaxed placeholder:text-gray-400';
+const AGENT_EDITOR_CONTENT_KEYS: Record<AgentEditorTab, AgentEditorContentKey> = {
+  soul: 'soulContent',
+  user: 'userContent',
+  agents: 'agentsContent',
+  tools: 'toolsContent',
+  heartbeat: 'heartbeatContent',
+  identity: 'identityContent',
+};
 
 function readSidebarListTab(currentView: ViewType): SidebarListTab {
   if (typeof window !== 'undefined') {
@@ -208,7 +230,7 @@ function SidebarHeader({ openclawVersion, appVersion }: { openclawVersion: strin
   );
 }
 
-export default function Sidebar({ 
+export default function Sidebar({
   currentView, 
   settingsTab = 'gateway', 
   activeSessionId, 
@@ -224,7 +246,7 @@ export default function Sidebar({
   activeGroupId,
   onSelectGroup
 }: SidebarProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [appVersionInfo, setAppVersionInfo] = useState<AppVersionInfo | null>(null);
 
   useEffect(() => {
@@ -266,11 +288,15 @@ export default function Sidebar({
   // Modal State
   const [newSessionData, setNewSessionData] = useState({ 
     id: '', name: '', model: '', process_start_tag: '', process_end_tag: '',
+    runtimeMode: 'configured' as AgentRuntimeMode,
+    systemPromptMode: 'system' as AgentSystemPromptMode,
+    toolMode: 'full' as AgentToolMode,
+    runtimeMetrics: null as AgentRuntimeMetrics | null,
     soulContent: '', userContent: '', agentsContent: '', toolsContent: '', heartbeatContent: '', identityContent: '',
     fallbackMode: 'disabled' as ModelFallbackMode,
     fallbacks: [] as string[],
   });
-  const [activeTab, setActiveTab] = useState<'soul'|'user'|'agents'|'tools'|'heartbeat'|'identity'>('soul');
+  const [activeTab, setActiveTab] = useState<AgentEditorTab>('soul');
   const [isModelDropdownOpen, setIsModelDropdownOpen] = useState(false);
   const [modelSearchQuery, setModelSearchQuery] = useState('');
   const [modelProviderTab, setModelProviderTab] = useState('all');
@@ -311,6 +337,77 @@ export default function Sidebar({
       : shouldLockAgentFallbackTabs && newSessionData.fallbackMode === 'inherit'
         ? 'custom'
         : newSessionData.fallbackMode;
+  const runtimeModeOptions: Array<{ id: AgentRuntimeMode; label: string }> = [
+    { id: 'configured', label: t('sidebar.runtimeModeConfigured') },
+    { id: 'direct', label: t('sidebar.runtimeModeDirect') },
+  ];
+  const systemPromptModeOptions: Array<{ id: AgentSystemPromptMode; label: string }> = [
+    { id: 'system', label: t('sidebar.systemPromptModeSystem') },
+    { id: 'agent', label: t('sidebar.systemPromptModeAgent') },
+  ];
+  const toolModeOptions: Array<{ id: AgentToolMode; label: string }> = [
+    { id: 'full', label: t('sidebar.toolModeFull') },
+    { id: 'coding', label: t('sidebar.toolModeCoding') },
+    { id: 'messaging', label: t('sidebar.toolModeMessaging') },
+    { id: 'minimal', label: t('sidebar.toolModeMinimal') },
+    { id: 'off', label: t('sidebar.toolModeOff') },
+  ];
+  const formatCompactCount = (count: number) => {
+    const language = i18n.language || '';
+    if (language.startsWith('zh')) {
+      if (count >= 10000) {
+        return `${(count / 10000).toFixed(1).replace(/\\.0$/, '')}万`;
+      }
+      return count.toLocaleString();
+    }
+    if (count >= 1000) {
+      return `${(count / 1000).toFixed(1).replace(/\\.0$/, '')}k`;
+    }
+    return count.toLocaleString();
+  };
+  const formatCharCountLabel = (count: number | null | undefined) => (
+    typeof count === 'number' && Number.isFinite(count)
+      ? t('sidebar.charCountLabel', { count: formatCompactCount(count) })
+      : ''
+  );
+  const buildLocalAgentPromptChars = () => {
+    const sections = [
+      ['IDENTITY.md', newSessionData.identityContent],
+      ['SOUL.md', newSessionData.soulContent],
+      ['AGENTS.md', newSessionData.agentsContent],
+      ['USER.md', newSessionData.userContent],
+      ['TOOLS.md', newSessionData.toolsContent],
+      ['HEARTBEAT.md', newSessionData.heartbeatContent],
+    ]
+      .map(([filename, content]) => [filename, String(content || '').trim()] as const)
+      .filter(([, content]) => content.length > 0)
+      .map(([filename, content]) => `## ${filename}\n\n${content}`);
+
+    if (sections.length === 0) {
+      return 0;
+    }
+
+    return [
+      `# Agent ${newSessionData.id || 'agent'}`,
+      'Follow this agent-specific prompt. The sections below come from this agent workspace.',
+      ...sections,
+    ].join('\n\n').length;
+  };
+  const systemPromptChars = newSessionData.systemPromptMode === 'agent'
+    ? buildLocalAgentPromptChars()
+    : newSessionData.runtimeMetrics?.systemPrompt?.systemChars;
+  const toolSchemaChars = newSessionData.runtimeMetrics?.tools?.charsByMode?.[newSessionData.toolMode];
+  const systemPromptTitle = `${t('sidebar.systemPromptModeTitle')}${formatCharCountLabel(systemPromptChars)}`;
+  const toolModeTitle = `${t('sidebar.toolModeTitle')}${formatCharCountLabel(toolSchemaChars)}`;
+  const getRuntimeModeLabel = (mode?: string) => runtimeModeOptions.find((option) => option.id === mode)?.label || t('sidebar.runtimeModeConfigured');
+  const getSystemPromptModeLabel = (mode?: string) => systemPromptModeOptions.find((option) => option.id === mode)?.label || t('sidebar.systemPromptModeSystem');
+  const getToolModeLabel = (mode?: string) => toolModeOptions.find((option) => option.id === mode)?.label || t('sidebar.toolModeFull');
+  const getEffectiveSystemPromptModeLabel = (runtimeMode?: string, mode?: string) => (
+    runtimeMode === 'direct' ? t('sidebar.runtimeModeDirect') : getSystemPromptModeLabel(mode)
+  );
+  const getEffectiveToolModeLabel = (runtimeMode?: string, mode?: string) => (
+    runtimeMode === 'direct' ? t('sidebar.runtimeModeDirect') : getToolModeLabel(mode)
+  );
   const [sidebarFavorites, setSidebarFavorites] = useState<SidebarFavorites>(() => readSidebarFavorites());
   const [sidebarFavoritesLoaded, setSidebarFavoritesLoaded] = useState(false);
 
@@ -631,6 +728,9 @@ export default function Sidebar({
             id: normalizedSessionData.id,
             name: normalizedSessionData.name,
             model: normalizedSessionData.model,
+            runtimeMode: normalizedSessionData.runtimeMode,
+            systemPromptMode: normalizedSessionData.systemPromptMode,
+            toolMode: normalizedSessionData.toolMode,
             fallbackMode: normalizedSessionData.fallbackMode,
             fallbacks: normalizedSessionData.fallbacks,
             process_start_tag: normalizedSessionData.process_start_tag,
@@ -650,6 +750,9 @@ export default function Sidebar({
           body: JSON.stringify({
             name: normalizedSessionData.name,
             model: normalizedSessionData.model,
+            runtimeMode: normalizedSessionData.runtimeMode,
+            systemPromptMode: normalizedSessionData.systemPromptMode,
+            toolMode: normalizedSessionData.toolMode,
             fallbackMode: normalizedSessionData.fallbackMode,
             fallbacks: normalizedSessionData.fallbacks,
             process_start_tag: normalizedSessionData.process_start_tag,
@@ -675,6 +778,10 @@ export default function Sidebar({
             model: '',
             process_start_tag: '',
             process_end_tag: '',
+            runtimeMode: 'configured',
+            systemPromptMode: 'system',
+            toolMode: 'full',
+            runtimeMetrics: null,
             soulContent: '',
             userContent: '',
             agentsContent: '',
@@ -780,6 +887,10 @@ export default function Sidebar({
           modelOverride: '',
           fallbackMode: 'inherit' as ModelFallbackMode,
           fallbacks: [] as string[],
+          runtimeMode: 'configured' as AgentRuntimeMode,
+          systemPromptMode: 'system' as AgentSystemPromptMode,
+          toolMode: 'full' as AgentToolMode,
+          runtimeMetrics: null as AgentRuntimeMetrics | null,
         };
         if (fullSession) {
           const configRes = await fetch(`/api/sessions/${session.id}/configs`);
@@ -794,6 +905,10 @@ export default function Sidebar({
             id: fullSession.agentId || '',
             name: fullSession.name || '', 
             model: configs.modelOverride || configs.model || '',
+            runtimeMode: configs.runtimeMode || fullSession.runtimeMode || fullSession.runtime_mode || 'configured',
+            systemPromptMode: configs.systemPromptMode || fullSession.systemPromptMode || fullSession.system_prompt_mode || 'system',
+            toolMode: configs.toolMode || fullSession.toolMode || fullSession.tool_mode || 'full',
+            runtimeMetrics: configs.runtimeMetrics || null,
             process_start_tag: fullSession.process_start_tag || '',
             process_end_tag: fullSession.process_end_tag || '',
             soulContent: configs.soulContent || '',
@@ -1246,6 +1361,10 @@ export default function Sidebar({
                   id: '', 
                   name: '', 
                   model: '', 
+                  runtimeMode: 'configured',
+                  systemPromptMode: 'system',
+                  toolMode: 'full',
+                  runtimeMetrics: null,
                   fallbackMode: 'disabled',
                   fallbacks: [],
                   process_start_tag: '',
@@ -1560,6 +1679,69 @@ export default function Sidebar({
                     className="min-w-0"
                   />
                 </div>
+
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-sm font-bold text-gray-700">{t('sidebar.runtimeModeTitle')}</div>
+                    <div className="mt-1 text-xs text-gray-400">{t('sidebar.runtimeModeHint')}</div>
+                  </div>
+                  <div className="inline-flex items-center gap-1 rounded-2xl border border-gray-200 bg-gray-100/80 p-1">
+                    {runtimeModeOptions.map((option) => (
+                      <button
+                        key={option.id}
+                        type="button"
+                        onClick={() => setNewSessionData((prev) => ({ ...prev, runtimeMode: option.id }))}
+                        className={`min-w-[96px] rounded-xl px-4 py-2 text-sm transition-all ${
+                          newSessionData.runtimeMode === option.id
+                            ? 'bg-white font-bold text-gray-900'
+                            : 'text-gray-500 hover:bg-white/50 hover:text-gray-700'
+                        }`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {newSessionData.runtimeMode === 'configured' ? (
+                  <div className="rounded-2xl border border-gray-100 bg-gray-50/40 p-4 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <span className="text-sm font-bold text-gray-700">{systemPromptTitle}</span>
+                      <select
+                        value={newSessionData.systemPromptMode}
+                        onChange={(event) => setNewSessionData((prev) => ({
+                          ...prev,
+                          systemPromptMode: event.target.value as AgentSystemPromptMode,
+                        }))}
+                        className="min-w-[180px] px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 outline-none transition-all focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                      >
+                        {systemPromptModeOptions.map((option) => (
+                          <option key={option.id} value={option.id}>{option.label}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <span className="text-sm font-bold text-gray-700">{toolModeTitle}</span>
+                      <select
+                        value={newSessionData.toolMode}
+                        onChange={(event) => setNewSessionData((prev) => ({
+                          ...prev,
+                          toolMode: event.target.value as AgentToolMode,
+                        }))}
+                        className="min-w-[180px] px-3 py-2 bg-white border border-gray-200 rounded-xl text-sm text-gray-700 outline-none transition-all focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                      >
+                        {toolModeOptions.map((option) => (
+                          <option key={option.id} value={option.id}>{option.label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-2xl border border-gray-100 bg-gray-50/40 p-4 text-xs text-gray-400">
+                    {t('sidebar.runtimeModeDirectHint')}
+                  </div>
+                )}
                 
                 <div className="flex items-center gap-4 mb-1.5">
                   <span className="text-sm font-bold text-gray-700">{t('sidebar.outputProcess')}</span>
@@ -1602,7 +1784,7 @@ export default function Sidebar({
                       { id: 'identity', name: t('sidebar.tabIdentity') }
                     ].map(tab => (
                       <button
-                        key={tab.id} type="button" onClick={() => setActiveTab(tab.id as any)}
+                        key={tab.id} type="button" onClick={() => setActiveTab(tab.id as AgentEditorTab)}
                         className={`flex-none px-3 py-1.5 text-sm rounded-lg transition-all whitespace-nowrap border border-gray-200 ${activeTab === tab.id ? 'bg-white text-blue-600 font-bold' : 'font-normal text-gray-500 hover:text-gray-700 hover:bg-white/50'}`}
                       >
                         {tab.name}
@@ -1611,8 +1793,8 @@ export default function Sidebar({
                   </div>
                   <div className="flex-1 relative">
                     <textarea 
-                      value={newSessionData[`${activeTab}Content` as keyof typeof newSessionData]}
-                      onChange={e => setNewSessionData(prev => ({...prev, [`${activeTab}Content`]: e.target.value}))}
+                      value={newSessionData[AGENT_EDITOR_CONTENT_KEYS[activeTab]]}
+                      onChange={e => setNewSessionData(prev => ({...prev, [AGENT_EDITOR_CONTENT_KEYS[activeTab]]: e.target.value}))}
                       placeholder={templates[activeTab as keyof typeof templates]}
                       className={MODAL_EDITOR_TEXTAREA_CLASS}
                     />
@@ -1691,6 +1873,31 @@ export default function Sidebar({
                       {viewingSession.model ? (availableModels.find(m => m.id === viewingSession.model)?.alias || viewingSession.model) : t('sidebar.defaultModel')}
                     </span>
                   </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                  {(() => {
+                    const runtimeMode = viewingSession.runtimeMode || viewingSession.runtime_mode;
+                    const systemPromptMode = viewingSession.systemPromptMode || viewingSession.system_prompt_mode;
+                    const toolMode = viewingSession.toolMode || viewingSession.tool_mode;
+
+                    return (
+                      <>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-1.5">{t('sidebar.runtimeModeTitle')}</label>
+                    <p className="text-sm text-gray-900 bg-gray-50 p-3 rounded-xl border border-gray-100">{getRuntimeModeLabel(runtimeMode)}</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-1.5">{t('sidebar.systemPromptModeTitle')}</label>
+                    <p className="text-sm text-gray-900 bg-gray-50 p-3 rounded-xl border border-gray-100">{getEffectiveSystemPromptModeLabel(runtimeMode, systemPromptMode)}</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-semibold text-gray-700 mb-1.5">{t('sidebar.toolModeTitle')}</label>
+                    <p className="text-sm text-gray-900 bg-gray-50 p-3 rounded-xl border border-gray-100">{getEffectiveToolModeLabel(runtimeMode, toolMode)}</p>
+                  </div>
+                      </>
+                    );
+                  })()}
                 </div>
 
                 {/* 输出工作过程 - read-only */}

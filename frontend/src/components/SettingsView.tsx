@@ -527,7 +527,8 @@ const isPersistedUpdateRestartModalStateFresh = (state: PersistedUpdateRestartMo
 
 const BROWSER_CHECK_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-config': { progress: 12, labelKey: 'settings.gateway.browserTaskPhases.readConfig' },
-  'read-status': { progress: 28, labelKey: 'settings.gateway.browserTaskPhases.readStatus' },
+  'wait-gateway': { progress: 22, labelKey: 'settings.gateway.browserTaskPhases.waitGateway' },
+  'read-status': { progress: 32, labelKey: 'settings.gateway.browserTaskPhases.readStatus' },
   'start-browser': { progress: 52, labelKey: 'settings.gateway.browserTaskPhases.startBrowser' },
   'wait-running': { progress: 68, labelKey: 'settings.gateway.browserTaskPhases.waitRunning' },
   'open-validation': { progress: 84, labelKey: 'settings.gateway.browserTaskPhases.openValidation' },
@@ -541,8 +542,10 @@ const BROWSER_REPAIR_PHASE_VISUALS: Record<string, BrowserTaskPhaseVisual> = {
   'read-status': { progress: 28, labelKey: 'settings.gateway.browserTaskPhases.readStatus' },
   'enable-permissions': { progress: 42, labelKey: 'settings.gateway.browserTaskPhases.enablePermissions' },
   'sync-browser-settings': { progress: 52, labelKey: 'settings.gateway.browserTaskPhases.syncBrowserSettings' },
-  'restart-gateway': { progress: 58, labelKey: 'settings.gateway.browserTaskPhases.restartGateway' },
-  'stop-browser': { progress: 70, labelKey: 'settings.gateway.browserTaskPhases.stopBrowser' },
+  'refresh-plugins': { progress: 56, labelKey: 'settings.gateway.browserTaskPhases.refreshPlugins' },
+  'restart-gateway': { progress: 60, labelKey: 'settings.gateway.browserTaskPhases.restartGateway' },
+  'wait-gateway': { progress: 66, labelKey: 'settings.gateway.browserTaskPhases.waitGateway' },
+  'stop-browser': { progress: 72, labelKey: 'settings.gateway.browserTaskPhases.stopBrowser' },
   'start-browser': { progress: 82, labelKey: 'settings.gateway.browserTaskPhases.startBrowser' },
   'wait-running': { progress: 90, labelKey: 'settings.gateway.browserTaskPhases.waitRunning' },
   'reset-profile': { progress: 96, labelKey: 'settings.gateway.browserTaskPhases.resetProfile' },
@@ -625,6 +628,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
   const [permissionsPasswordUser, setPermissionsPasswordUser] = useState('');
   const [permissionsPasswordError, setPermissionsPasswordError] = useState<InlineErrorState>(EMPTY_INLINE_ERROR);
   const [isSubmittingPermissionsPassword, setIsSubmittingPermissionsPassword] = useState(false);
+  const [maxPermissionsConfirmPendingEnabled, setMaxPermissionsConfirmPendingEnabled] = useState<boolean | null>(null);
+  const [restartAfterPermissionsPasswordSubmit, setRestartAfterPermissionsPasswordSubmit] = useState(false);
   const [allowedHosts, setAllowedHosts] = useState<string[]>([]);
   const [newHost, setNewHost] = useState('');
   const [editingHost, setEditingHost] = useState<string | null>(null);
@@ -2180,13 +2185,23 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     return true;
   };
 
-  const handleRestartGateway = () => {
-    if (!testResult?.success || isRestarting || gatewayRestartModalStage) {
-      return;
+  const openGatewayRestartConfirm = () => {
+    if (
+      isRestarting
+      || gatewayRestartModalStage
+      || browserHeadedModeModalStage === 'restarting'
+      || updateRestartModalStage === 'restarting'
+    ) {
+      return false;
     }
     setRestartSuccess(false);
     setGatewayRestartModalDetail('');
     setGatewayRestartModalStage('confirm');
+    return true;
+  };
+
+  const handleRestartGateway = () => {
+    openGatewayRestartConfirm();
   };
 
   const applyGatewayRestartTaskState = (data: { restart?: unknown }) => {
@@ -2440,6 +2455,12 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     setPermissionsPasswordUser('');
     setPermissionsPassword('');
     setPermissionsPasswordError(EMPTY_INLINE_ERROR);
+    setRestartAfterPermissionsPasswordSubmit(false);
+  };
+
+  const closeMaxPermissionsConfirmModal = () => {
+    if (isTogglingPermissions) return;
+    setMaxPermissionsConfirmPendingEnabled(null);
   };
 
   const requestMaxPermissionsChange = async (nextEnabled: boolean, systemPassword?: string) => {
@@ -2455,8 +2476,10 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     return { res, data };
   };
 
-  const handleToggleMaxPermissions = async () => {
-    const nextEnabled = !maxPermissions;
+  const applyMaxPermissionsChange = async (
+    nextEnabled: boolean,
+    options?: { restartAfterSuccess?: boolean },
+  ) => {
     setMaxPermissions(nextEnabled);
     setIsTogglingPermissions(true);
     setPermissionsError(EMPTY_INLINE_ERROR);
@@ -2471,7 +2494,15 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         setPermissionsError(EMPTY_INLINE_ERROR);
         setBrowserHealth(null);
         setGatewayRestartNoticeSource('permissions');
+        if (data.restartRequired) {
+          if (options?.restartAfterSuccess) {
+            void handleConfirmRestartGateway();
+          } else {
+            openGatewayRestartConfirm();
+          }
+        }
       } else if (nextEnabled && responseNeedsHostTakeoverPasswordPrompt(data)) {
+        setRestartAfterPermissionsPasswordSubmit(!!options?.restartAfterSuccess);
         if (typeof data.enabled === 'boolean' || data.hostTakeover) {
           applyMaxPermissionsState(data);
         } else {
@@ -2509,6 +2540,23 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
     }
   };
 
+  const handleToggleMaxPermissions = () => {
+    const nextEnabled = !maxPermissions;
+    setPermissionsError(EMPTY_INLINE_ERROR);
+    setPermissionsNotice(null);
+    setBrowserHealthNotice(null);
+    setGatewayRestartNoticeSource(null);
+    setBrowserHealthError(EMPTY_INLINE_ERROR);
+    setMaxPermissionsConfirmPendingEnabled(nextEnabled);
+  };
+
+  const handleConfirmMaxPermissionsToggle = async () => {
+    if (maxPermissionsConfirmPendingEnabled === null) return;
+    const nextEnabled = maxPermissionsConfirmPendingEnabled;
+    setMaxPermissionsConfirmPendingEnabled(null);
+    await applyMaxPermissionsChange(nextEnabled, { restartAfterSuccess: true });
+  };
+
   const handleSubmitPermissionsPassword = async () => {
     if (!permissionsPassword.trim()) {
       setPermissionsPasswordError({
@@ -2533,6 +2581,14 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         setPermissionsPasswordError(EMPTY_INLINE_ERROR);
         setBrowserHealth(null);
         setGatewayRestartNoticeSource('permissions');
+        if (data.restartRequired) {
+          if (restartAfterPermissionsPasswordSubmit) {
+            setRestartAfterPermissionsPasswordSubmit(false);
+            void handleConfirmRestartGateway();
+          } else {
+            openGatewayRestartConfirm();
+          }
+        }
         return;
       }
 
@@ -2723,7 +2779,19 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
       });
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
-        setBrowserHealth(null);
+        const snapshot = data.health as BrowserHealthSnapshot | undefined;
+        if (snapshot) {
+          applyBrowserHealthSnapshot(snapshot);
+          if (!snapshot.healthy) {
+            setBrowserHealthError({
+              message: t('gateway.browserHealthFailed'),
+              detail: snapshot.validationDetail || snapshot.rawDetail || snapshot.detectError || '',
+            });
+            return;
+          }
+        } else {
+          setBrowserHealth(null);
+        }
         setBrowserHealthNotice({
           tone: 'success',
           message: t('settings.gateway.browserSelfHealSuccess'),
@@ -3821,6 +3889,11 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
         : gatewayRestartModalStage === 'failure'
           ? t('settings.gateway.restartGatewayRestartFailedMessage')
           : '';
+  const canRestartGateway = !isRestarting
+    && gatewayRestartModalStage === null
+    && browserHeadedModeModalStage !== 'restarting'
+    && updateRestartModalStage !== 'restarting';
+  const canSaveGateway = !isLoading && !!url.trim();
   const updateRestartModalTitle = updateRestartModalStage === 'confirm'
     ? t('settings.about.restartServiceConfirmTitle')
     : updateRestartModalStage === 'restarting'
@@ -4583,8 +4656,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                 <div className="flex gap-2 sm:gap-3 items-center">
                   <button
                     onClick={handleRestartGateway}
-                    disabled={!testResult?.success || isRestarting || gatewayRestartModalStage !== null || browserHeadedModeModalStage === 'restarting' || updateRestartModalStage === 'restarting'}
-                    className={`inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 text-sm font-medium rounded-xl transition-all ${ testResult?.success ? 'text-orange-600 bg-orange-50 hover:bg-orange-100 border border-orange-200' : 'text-gray-400 bg-gray-100 border border-gray-200 cursor-not-allowed' }`}
+                    disabled={!canRestartGateway}
+                    className={`inline-flex items-center gap-2 px-4 sm:px-5 py-2.5 text-sm font-medium rounded-xl transition-all ${ canRestartGateway ? 'text-orange-600 bg-orange-50 hover:bg-orange-100 border border-orange-200' : 'text-gray-400 bg-gray-100 border border-gray-200 cursor-not-allowed' }`}
                   >
                     {isRestarting ? <Loader2 className="w-4 h-4 animate-spin sm:block hidden" /> : <Loader2 className="w-4 h-4 sm:block hidden" />}
                     {restartSuccess ? t('settings.gateway.restarted') : <><span className="sm:hidden">{t('common.restart')}</span><span className="hidden sm:inline">{t('settings.gateway.restartGateway')}</span></>}
@@ -4598,8 +4671,8 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
                   )}
                   <button
                     onClick={handleSave}
-                    disabled={isLoading || !testResult?.success}
-                    className={`inline-flex items-center gap-2 px-5 sm:px-8 py-2.5 text-sm font-medium rounded-xl text-white transition-all ${ isLoading || !testResult?.success ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700' }`}
+                    disabled={!canSaveGateway}
+                    className={`inline-flex items-center gap-2 px-5 sm:px-8 py-2.5 text-sm font-medium rounded-xl text-white transition-all ${ !canSaveGateway ? 'bg-gray-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700' }`}
                   >
                     {isLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : gatewaySaved ? <><Check className="w-4 h-4" /> {t('settings.gateway.saved')}</> : <><span className="sm:hidden">{t('common.save')}</span><span className="hidden sm:inline">{t('settings.gateway.save')}</span></>}
                   </button>
@@ -5579,6 +5652,53 @@ export default function SettingsView({ isConnected, settingsTab, onMenuClick, on
 
         </div>
       </div>
+
+      {maxPermissionsConfirmPendingEnabled !== null && (
+        <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">
+          <div className="absolute inset-0 bg-black/40 backdrop-blur-sm transition-opacity" />
+          <div className="relative z-10 w-full max-w-sm overflow-y-auto rounded-2xl border border-gray-200 bg-white max-h-[calc(100vh-2rem)] animate-in fade-in zoom-in-95 duration-200">
+            <div className="p-6 text-center">
+              <div className="mx-auto mb-4 flex h-12 w-12 items-center justify-center rounded-full bg-amber-100">
+                {isTogglingPermissions
+                  ? <Loader2 className="h-6 w-6 animate-spin text-amber-600" />
+                  : <Zap className="h-6 w-6 text-amber-600" />}
+              </div>
+              <h3 className="mb-2 text-lg font-bold text-gray-900">
+                {t(maxPermissionsConfirmPendingEnabled
+                  ? 'settings.gateway.maxPermissionsRestartConfirmTitle'
+                  : 'settings.gateway.maxPermissionsDisableRestartConfirmTitle')}
+              </h3>
+              <p className="text-sm text-gray-500 whitespace-pre-wrap">
+                {t(maxPermissionsConfirmPendingEnabled
+                  ? 'settings.gateway.maxPermissionsRestartConfirmMessage'
+                  : 'settings.gateway.maxPermissionsDisableRestartConfirmMessage')}
+              </p>
+            </div>
+            <div className="flex gap-3 border-t border-gray-100 bg-gray-50 p-4">
+              <button
+                type="button"
+                onClick={closeMaxPermissionsConfirmModal}
+                disabled={isTogglingPermissions}
+                className="flex-1 rounded-xl border border-gray-200 bg-white px-4 py-2.5 font-semibold text-gray-700 transition-all hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {t('common.cancel')}
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleConfirmMaxPermissionsToggle()}
+                disabled={isTogglingPermissions}
+                className="flex-1 rounded-xl bg-blue-600 px-4 py-2.5 font-semibold text-white transition-all hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isTogglingPermissions
+                  ? t('settings.gateway.hostTakeoverPasswordSubmitting')
+                  : t(maxPermissionsConfirmPendingEnabled
+                    ? 'settings.gateway.maxPermissionsRestartConfirmAction'
+                    : 'settings.gateway.maxPermissionsDisableRestartConfirmAction')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {permissionsPasswordModalOpen && (
         <div className="fixed inset-0 z-[230] flex items-center justify-center p-4">

@@ -4,6 +4,7 @@ import crypto from 'crypto';
 
 const CHAT_SEND_START_TIMEOUT_MS = 5 * 60 * 1000;
 const CHAT_HISTORY_TIMEOUT_MS = 90 * 1000;
+const GATEWAY_CONNECT_TIMEOUT_MS = 15000;
 
 interface OpenClawConfig {
   gatewayUrl: string;
@@ -269,6 +270,18 @@ export class OpenClawClient extends EventEmitter {
     }
 
     this.connectPromise = new Promise((resolve, reject) => {
+      let settled = false;
+      const connectTimer = setTimeout(() => {
+        fail(new Error('OpenClaw gateway connect timeout'));
+      }, GATEWAY_CONNECT_TIMEOUT_MS);
+
+      const resolveOnce = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(connectTimer);
+        resolve();
+      };
+
       const wsUrl = this.config.gatewayUrl.replace(/^http/, 'ws');
       const wsOptions: any = {};
       if (this.config.gatewayUrl.includes('localhost') || this.config.gatewayUrl.includes('127.0.0.1')) {
@@ -277,8 +290,15 @@ export class OpenClawClient extends EventEmitter {
       this.ws = new WebSocket(wsUrl, wsOptions);
 
       const fail = (err: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(connectTimer);
         this.connected = false;
         this.connectPromise = null;
+        try {
+          this.ws?.close();
+        } catch {}
+        this.ws = null;
         this.rejectPendingRequests(err);
         reject(err);
       };
@@ -315,7 +335,7 @@ export class OpenClawClient extends EventEmitter {
               this.connected = true;
               this.connectPromise = null;
               this.emit('connected');
-              resolve();
+              resolveOnce();
             } catch (err: any) {
               fail(new Error(err?.message || 'Gateway connect failed'));
             }
@@ -403,7 +423,9 @@ export class OpenClawClient extends EventEmitter {
       });
 
       this.ws.on('error', (err) => {
-        this.emit('error', err as Error);
+        if (this.listenerCount('error') > 0) {
+          this.emit('error', err as Error);
+        }
         if (!this.connected) fail(err as Error);
       });
     });

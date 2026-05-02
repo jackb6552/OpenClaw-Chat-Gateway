@@ -1,4 +1,4 @@
-import express from 'express';
+import express, { type Response as ExpressResponse } from 'express';
 import axios from 'axios';
 import cors from 'cors';
 import path from 'path';
@@ -57,7 +57,17 @@ import {
   ensureManagedDocumentToolingReady,
   hasDocumentUploads,
 } from './document-tooling';
-import type { CapabilityCacheRow, ChatRow, MessagePageInfo, MessageSearchMatch, StoredFileRow } from './db';
+import type {
+  AgentRuntimeMode,
+  AgentSystemPromptMode,
+  AgentToolMode,
+  CapabilityCacheRow,
+  ChatRow,
+  MessagePageInfo,
+  MessageSearchMatch,
+  SessionRow,
+  StoredFileRow,
+} from './db';
 import {
   type ChatHistorySnapshot,
   extractLatestAssistantOutcomeRecord,
@@ -271,6 +281,7 @@ const CHAT_FINAL_EVENT_SETTLE_GRACE_MS = 1500;
 const CHAT_EMPTY_COMPLETION_RETRY_WINDOW_MS = 5 * 60 * 1000;
 const CHAT_HISTORY_ACTIVITY_GRACE_MS = 2 * 60 * 1000;
 const CHAT_ORPHAN_ABORT_TIMEOUT_MS = 5000;
+const CHAT_ABORT_RETRY_DELAYS_MS = [5000, 15000, 30000, 60000];
 const GROUP_SSE_KEEPALIVE_MS = 15000;
 const BROWSER_HEALTH_CLI_TIMEOUT_MS = 15000;
 const BROWSER_HEALTH_EXEC_TIMEOUT_MS = 20000;
@@ -280,9 +291,12 @@ const BROWSER_HEALTH_FALLBACK_VALIDATION_URL = 'http://example.com';
 const BROWSER_HEALTH_START_TIMEOUT_MS = 30000;
 const BROWSER_HEALTH_OPEN_TIMEOUT_MS = 40000;
 const BROWSER_HEALTH_SNAPSHOT_TIMEOUT_MS = 45000;
+const BROWSER_HEALTH_GATEWAY_READY_TIMEOUT_MS = 60 * 1000;
+const BROWSER_HEALTH_GATEWAY_READY_POLL_INTERVAL_MS = 1500;
+const BROWSER_SELF_HEAL_GATEWAY_READY_TIMEOUT_MS = 2 * 60 * 1000;
+const BROWSER_SELF_HEAL_PLUGIN_REGISTRY_REFRESH_TIMEOUT_MS = 45 * 1000;
 const BROWSER_SELF_HEAL_STOP_TIMEOUT_MS = 8000;
 const BROWSER_SELF_HEAL_RESET_PROFILE_TIMEOUT_MS = 45000;
-const OPENCLAW_DEVICE_PAIRING_TIMEOUT_MS = 15000;
 const BROWSER_POST_RESTART_WARMUP_DELAY_MS = 8000;
 const BROWSER_POST_RESTART_WARMUP_MARKER_MAX_AGE_MS = 30 * 60 * 1000;
 const BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS = 3 * 60 * 1000;
@@ -514,12 +528,6 @@ type DevicePairingStatusSnapshot = {
   rawDetail: string | null;
 };
 
-type DevicePairingGatewayConnectionConfig = {
-  gatewayUrl: string;
-  token?: string;
-  password?: string;
-};
-
 type OpenClawLocalDevicePairingList = {
   pending?: unknown[];
   paired?: unknown[];
@@ -563,9 +571,10 @@ const UPDATE_RESTART_STEP_IDS: UpdateRestartStepId[] = [
 const OPENCLAW_LATEST_VERSION_CACHE_TTL_MS = 60 * 1000;
 const OPENCLAW_GATEWAY_HEALTH_PROBE_TIMEOUTS_MS = [700, 1000] as const;
 const OPENCLAW_GATEWAY_READY_PROBE_TIMEOUT_MS = 20000;
-const OPENCLAW_GATEWAY_READY_PROBE_STEP_TIMEOUT_MS = 2000;
+const OPENCLAW_GATEWAY_READY_PROBE_STEP_TIMEOUT_MS = 5000;
 const OPENCLAW_GATEWAY_READY_RESULT_CACHE_TTL_MS = 3000;
 const OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS = 20 * 1000;
+const OPENCLAW_GATEWAY_MANUAL_RESTART_STABLE_WINDOW_MS = 5 * 1000;
 const OPENCLAW_UPDATE_RUNTIME_RECONCILE_INTERVAL_MS = 1200;
 const OPENCLAW_UPDATE_GATEWAY_RECOVERY_POLL_INTERVAL_MS = 5 * 1000;
 const OPENCLAW_UPDATE_SUCCESS_AUTO_RESET_MS = 5000;
@@ -1703,12 +1712,38 @@ function normalizeCliText(value: unknown): string {
   return typeof value === 'string' && value.trim() ? value.trim() : '';
 }
 
-function isLoopbackHostname(hostname: string): boolean {
+function normalizeGatewayHostname(hostname: string): string {
   const normalized = normalizeCliText(hostname).toLowerCase();
+  return normalized.startsWith('[') && normalized.endsWith(']')
+    ? normalized.slice(1, -1)
+    : normalized;
+}
+
+function isLoopbackHostname(hostname: string): boolean {
+  const normalized = normalizeGatewayHostname(hostname);
   return normalized === '127.0.0.1'
     || normalized === 'localhost'
-    || normalized === '::1'
-    || normalized === '[::1]';
+    || normalized === '::1';
+}
+
+function isLocalGatewayHostname(hostname: string): boolean {
+  const normalized = normalizeGatewayHostname(hostname);
+  if (!normalized) return false;
+  if (isLoopbackHostname(normalized)) return true;
+
+  const localNames = new Set<string>([
+    normalizeGatewayHostname(os.hostname()),
+    '0.0.0.0',
+    '::',
+  ]);
+
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries || []) {
+      localNames.add(normalizeGatewayHostname(entry.address));
+    }
+  }
+
+  return localNames.has(normalized);
 }
 
 function parseGatewayUrlForStatusProbe(gatewayUrl: string): { hostname: string; port: number | null } | null {
@@ -1841,6 +1876,21 @@ function readCliErrorDetail(error: any): string {
 
 function normalizeFallbackMode(value: unknown): 'inherit' | 'custom' | 'disabled' | undefined {
   return value === 'inherit' || value === 'custom' || value === 'disabled' ? value : undefined;
+}
+
+function normalizeAgentRuntimeMode(value: unknown): AgentRuntimeMode {
+  return value === 'direct' ? 'direct' : 'configured';
+}
+
+function normalizeAgentSystemPromptMode(value: unknown): AgentSystemPromptMode {
+  return value === 'agent' ? 'agent' : 'system';
+}
+
+function normalizeAgentToolMode(value: unknown): AgentToolMode {
+  if (value === 'coding' || value === 'messaging' || value === 'minimal' || value === 'off') {
+    return value;
+  }
+  return 'full';
 }
 
 function normalizeFallbackList(value: unknown): string[] {
@@ -3852,31 +3902,10 @@ function normalizeDevicePairingStatusSnapshot(raw: any, rawDetail?: string | nul
 
 let cachedOpenClawLocalDevicePairingApiPromise: Promise<OpenClawLocalDevicePairingApi> | null = null;
 
-function readConfiguredDevicePairingGatewayConnection(): DevicePairingGatewayConnectionConfig {
-  const config = configManager.getConfig();
-  return {
-    gatewayUrl: normalizeCliText(config.gatewayUrl) || 'ws://127.0.0.1:18789',
-    token: normalizeCliText(config.token) || undefined,
-    password: normalizeCliText(config.password) || undefined,
-  };
-}
-
-function shouldUseLocalDevicePairingFallback(
-  config: DevicePairingGatewayConnectionConfig,
-  error: unknown,
-) {
-  const detail = normalizeCliText(readCliErrorDetail(error) || (error as any)?.message).toLowerCase();
-  if (!detail.includes('pairing required')) {
-    return false;
-  }
-
-  const gatewayTarget = parseGatewayUrlForStatusProbe(config.gatewayUrl);
-  if (!gatewayTarget || !isLoopbackHostname(gatewayTarget.hostname)) {
-    return false;
-  }
-
-  return evaluateLocalGatewayCredentialMatch(config, gatewayTarget) !== false;
-}
+const importOpenClawEsmModule = new Function(
+  'specifier',
+  'return import(specifier)'
+) as (specifier: string) => Promise<unknown>;
 
 async function loadOpenClawLocalDevicePairingApi(): Promise<OpenClawLocalDevicePairingApi> {
   if (!cachedOpenClawLocalDevicePairingApiPromise) {
@@ -3897,7 +3926,7 @@ async function loadOpenClawLocalDevicePairingApi(): Promise<OpenClawLocalDeviceP
           continue;
         }
 
-        const imported = await import(pathToFileURL(apiPath).href) as Partial<OpenClawLocalDevicePairingApi>;
+        const imported = await importOpenClawEsmModule(pathToFileURL(apiPath).href) as Partial<OpenClawLocalDevicePairingApi>;
         if (
           typeof imported.listDevicePairing === 'function'
           && typeof imported.approveDevicePairing === 'function'
@@ -3918,50 +3947,19 @@ async function loadOpenClawLocalDevicePairingApi(): Promise<OpenClawLocalDeviceP
   }
 }
 
-async function listDevicePairingStatusFromGatewayOrLocalFallback() {
-  const connection = readConfiguredDevicePairingGatewayConnection();
-  const client = new OpenClawClient(connection);
-
-  try {
-    const list = await client.call('device.pair.list', {}, OPENCLAW_DEVICE_PAIRING_TIMEOUT_MS);
-    return normalizeDevicePairingStatusSnapshot(list);
-  } catch (error) {
-    if (!shouldUseLocalDevicePairingFallback(connection, error)) {
-      throw error;
-    }
-
-    const localApi = await loadOpenClawLocalDevicePairingApi();
-    const localList = await localApi.listDevicePairing();
-    return normalizeDevicePairingStatusSnapshot(localList);
-  } finally {
-    client.disconnect();
-  }
+async function listLocalDevicePairingStatus() {
+  const localApi = await loadOpenClawLocalDevicePairingApi();
+  const localList = await localApi.listDevicePairing();
+  return normalizeDevicePairingStatusSnapshot(localList);
 }
 
-async function approveDevicePairingRequestFromGatewayOrLocalFallback(requestId: string) {
-  const connection = readConfiguredDevicePairingGatewayConnection();
-  const client = new OpenClawClient(connection);
-
-  try {
-    return await client.call(
-      'device.pair.approve',
-      { requestId },
-      OPENCLAW_DEVICE_PAIRING_TIMEOUT_MS,
-    );
-  } catch (error) {
-    if (!shouldUseLocalDevicePairingFallback(connection, error)) {
-      throw error;
-    }
-
-    const localApi = await loadOpenClawLocalDevicePairingApi();
-    return await localApi.approveDevicePairing(requestId, { callerScopes: ['operator.admin'] });
-  } finally {
-    client.disconnect();
-  }
+async function approveLocalDevicePairingRequest(requestId: string) {
+  const localApi = await loadOpenClawLocalDevicePairingApi();
+  return await localApi.approveDevicePairing(requestId, { callerScopes: ['operator.admin'] });
 }
 
 async function readDevicePairingStatus(): Promise<DevicePairingStatusSnapshot> {
-  return listDevicePairingStatusFromGatewayOrLocalFallback();
+  return listLocalDevicePairingStatus();
 }
 
 async function safeReadDevicePairingStatus(): Promise<DevicePairingStatusSnapshot> {
@@ -3988,7 +3986,7 @@ async function approveLatestDevicePairingRequest() {
     );
   }
 
-  const approved = await approveDevicePairingRequestFromGatewayOrLocalFallback(latestPending.requestId);
+  const approved = await approveLocalDevicePairingRequest(latestPending.requestId);
   if (approved?.status === 'forbidden') {
     throw new StructuredRequestError(
       403,
@@ -4509,8 +4507,16 @@ async function probeGatewayConnectionStatus(params: {
   gatewayUrl: string;
   token?: string;
   password?: string;
-}): Promise<GatewayConnectionProbeResult> {
-  const probeKey = buildGatewayProbeCacheKey(params);
+}, options: {
+  preferLocalHealth?: boolean;
+  allowRpcProbe?: boolean;
+} = {}): Promise<GatewayConnectionProbeResult> {
+  const allowRpcProbe = options.allowRpcProbe !== false;
+  const probeKey = [
+    buildGatewayProbeCacheKey(params),
+    `preferLocalHealth=${options.preferLocalHealth ? '1' : '0'}`,
+    `allowRpcProbe=${allowRpcProbe ? '1' : '0'}`,
+  ].join('|');
   const now = Date.now();
   if (
     cachedGatewayProbeKey === probeKey
@@ -4527,15 +4533,18 @@ async function probeGatewayConnectionStatus(params: {
 
   const probePromise: Promise<GatewayConnectionProbeResult> = (async () => {
     const gatewayTarget = parseGatewayUrlForStatusProbe(params.gatewayUrl);
-    const isLocalLoopbackTarget = gatewayTarget ? isLoopbackHostname(gatewayTarget.hostname) : false;
+    const isLocalGatewayTarget = gatewayTarget ? isLocalGatewayHostname(gatewayTarget.hostname) : false;
     let localHealthFailureMessage: string | null = null;
+    let localHealthOk = false;
 
-    if (isLocalLoopbackTarget) {
+    if (isLocalGatewayTarget) {
       const health = await probeGatewayHealth(params.gatewayUrl);
       if (!health.ok) {
         // Older OpenClaw builds may not respond to /health reliably.
         // Fall back to a real gateway RPC probe before declaring disconnected.
         localHealthFailureMessage = health.message || 'Local OpenClaw gateway is not responding';
+      } else {
+        localHealthOk = true;
       }
 
       const credentialMatches = evaluateLocalGatewayCredentialMatch(params, gatewayTarget);
@@ -4546,6 +4555,30 @@ async function probeGatewayConnectionStatus(params: {
           source: 'local-runtime',
         };
       }
+
+      if (options?.preferLocalHealth && localHealthOk) {
+        return {
+          connected: true,
+          message: 'Local OpenClaw gateway ready',
+          source: 'local-runtime',
+        };
+      }
+
+      if (!allowRpcProbe) {
+        return {
+          connected: localHealthOk,
+          message: localHealthOk
+            ? 'Local OpenClaw gateway ready'
+            : (localHealthFailureMessage || 'Local OpenClaw gateway is not responding'),
+          source: 'local-runtime',
+        };
+      }
+    } else if (!allowRpcProbe) {
+      return {
+        connected: false,
+        message: 'Gateway HTTP health probe is only available for a local OpenClaw gateway.',
+        source: 'auth-probe',
+      };
     }
 
     const attemptGatewayReadyProbe = async (options?: {
@@ -4572,18 +4605,18 @@ async function probeGatewayConnectionStatus(params: {
         ]);
         return {
           connected: true,
-          message: isLocalLoopbackTarget
+          message: isLocalGatewayTarget
             ? (localHealthFailureMessage
               ? 'Local OpenClaw gateway ready after HTTP health probe failed'
               : 'Local OpenClaw gateway ready')
             : undefined,
-          source: isLocalLoopbackTarget ? 'local-runtime' : 'auth-probe',
+          source: isLocalGatewayTarget ? 'local-runtime' : 'auth-probe',
         };
       } catch (error: any) {
         return {
           connected: false,
           message: readCliErrorDetail(error) || error?.message || localHealthFailureMessage || 'Connection failed',
-          source: isLocalLoopbackTarget ? 'local-runtime' : 'auth-probe',
+          source: isLocalGatewayTarget ? 'local-runtime' : 'auth-probe',
         };
       } finally {
         if (timeoutId) {
@@ -5108,6 +5141,46 @@ async function runOpenClawBrowserCommand(args: string[], timeoutMs: number) {
   });
 }
 
+async function refreshOpenClawPluginRegistryForBrowserSelfHeal() {
+  const executablePath = await ensureResolvedOpenClawExecutablePath();
+  await execFilePromise(executablePath, ['plugins', 'registry', '--refresh'], {
+    timeout: BROWSER_SELF_HEAL_PLUGIN_REGISTRY_REFRESH_TIMEOUT_MS,
+    maxBuffer: 1024 * 1024,
+  });
+}
+
+async function waitForBrowserGatewayReady(
+  timeoutMs: number,
+  reportProgress?: BrowserTaskProgressReporter,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let lastFailure = 'OpenClaw gateway is not ready for browser control yet.';
+
+  while (Date.now() < deadline) {
+    reportProgress?.('wait-gateway', lastFailure);
+    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams(), {
+      preferLocalHealth: true,
+      allowRpcProbe: false,
+    });
+
+    if (probe.connected) {
+      reportProgress?.('wait-gateway');
+      return;
+    }
+
+    lastFailure = probe.message || lastFailure;
+    await sleep(BROWSER_HEALTH_GATEWAY_READY_POLL_INTERVAL_MS);
+  }
+
+  const error = new Error(lastFailure || 'Timed out waiting for OpenClaw gateway before browser control.');
+  (error as Error & { browserGatewayNotReady?: boolean }).browserGatewayNotReady = true;
+  throw error;
+}
+
+function isBrowserGatewayNotReadyError(error: unknown): boolean {
+  return !!(error as { browserGatewayNotReady?: boolean } | null)?.browserGatewayNotReady;
+}
+
 function buildBrowserProfileArgs(browserConfig: BrowserConfigState, args: string[]) {
   return ['--browser-profile', browserConfig.profile || BROWSER_HEALTH_PROFILE, ...args];
 }
@@ -5192,6 +5265,7 @@ async function runBrowserRuntimeReadinessCheck(reportProgress?: BrowserTaskProgr
   const checkedAt = Date.now();
   const browserConfig = readBrowserConfigState();
   const configError = readConfiguredBrowserValidationError(browserConfig);
+  let diagnostics = buildFallbackBrowserHealthDiagnostics(checkedAt);
 
   if (configError && browserConfig.enabled === false) {
     return {
@@ -5211,18 +5285,20 @@ async function runBrowserRuntimeReadinessCheck(reportProgress?: BrowserTaskProgr
     };
   }
 
-  reportProgress?.('read-status');
-  let diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
-  if (diagnostics.running === true && !diagnostics.detectError) {
-    return {
-      ready: true,
-      terminalFailure: false,
-      diagnostics,
-      detail: null,
-    };
-  }
-
   try {
+    await waitForBrowserGatewayReady(BROWSER_HEALTH_GATEWAY_READY_TIMEOUT_MS, reportProgress);
+
+    reportProgress?.('read-status');
+    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+    if (diagnostics.running === true && !diagnostics.detectError) {
+      return {
+        ready: true,
+        terminalFailure: false,
+        diagnostics,
+        detail: null,
+      };
+    }
+
     reportProgress?.('start-browser');
     await runOpenClawBrowserCommand(
       buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_START_TIMEOUT_MS), 'start']),
@@ -5248,7 +5324,9 @@ async function runBrowserRuntimeReadinessCheck(reportProgress?: BrowserTaskProgr
     };
   } catch (error: any) {
     const detail = readCliErrorDetail(error) || error?.message || 'Browser health check failed';
-    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
+    diagnostics = isBrowserGatewayNotReadyError(error)
+      ? buildFallbackBrowserHealthDiagnostics(checkedAt, detail)
+      : await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
     return {
       ready: false,
       terminalFailure: false,
@@ -5422,10 +5500,14 @@ async function runBrowserHealthCheck(reportProgress?: BrowserTaskProgressReporte
     });
   }
 
-  reportProgress?.('read-status');
-  let diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+  let diagnostics = buildFallbackBrowserHealthDiagnostics(checkedAt);
 
   try {
+    await waitForBrowserGatewayReady(BROWSER_HEALTH_GATEWAY_READY_TIMEOUT_MS, reportProgress);
+
+    reportProgress?.('read-status');
+    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt);
+
     reportProgress?.('start-browser');
     await runOpenClawBrowserCommand(
       buildBrowserProfileArgs(browserConfig, ['--timeout', String(BROWSER_HEALTH_START_TIMEOUT_MS), 'start']),
@@ -5467,7 +5549,9 @@ async function runBrowserHealthCheck(reportProgress?: BrowserTaskProgressReporte
   } catch (error: any) {
     const detail = readCliErrorDetail(error) || error?.message || 'Browser health check failed';
     reportProgress?.('finalize', detail);
-    diagnostics = await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
+    diagnostics = isBrowserGatewayNotReadyError(error)
+      ? buildFallbackBrowserHealthDiagnostics(checkedAt, detail)
+      : await readBrowserHealthDiagnostics(browserConfig, checkedAt, detail);
 
     return finalizeBrowserHealthSnapshot({
       ...diagnostics,
@@ -5622,11 +5706,20 @@ function buildGatewayStatusProbeParams() {
   const appConfig = configManager.getConfig();
   const localGatewayConfig = readLocalGatewayRuntimeConfig();
   const localPort = localGatewayConfig?.port ?? 18789;
+  const localGatewayUrl = `ws://127.0.0.1:${localPort}`;
+  const configuredGatewayUrl = normalizeCliText(appConfig.gatewayUrl);
+  const gatewayTarget = parseGatewayUrlForStatusProbe(configuredGatewayUrl || localGatewayUrl);
+  const shouldUseLocalRuntimeConfig = !!localGatewayConfig
+    && (!configuredGatewayUrl || (gatewayTarget ? isLocalGatewayHostname(gatewayTarget.hostname) : false));
 
   return {
-    gatewayUrl: normalizeCliText(appConfig.gatewayUrl) || `ws://127.0.0.1:${localPort}`,
-    token: normalizeCliText(appConfig.token) || localGatewayConfig?.token || undefined,
-    password: normalizeCliText(appConfig.password) || localGatewayConfig?.password || undefined,
+    gatewayUrl: shouldUseLocalRuntimeConfig ? localGatewayUrl : configuredGatewayUrl,
+    token: shouldUseLocalRuntimeConfig
+      ? (localGatewayConfig.token || undefined)
+      : (normalizeCliText(appConfig.token) || localGatewayConfig?.token || undefined),
+    password: shouldUseLocalRuntimeConfig
+      ? (localGatewayConfig.password || undefined)
+      : (normalizeCliText(appConfig.password) || localGatewayConfig?.password || undefined),
   };
 }
 
@@ -5639,8 +5732,27 @@ function isGatewayRuntimeStateKnown(runtimeState: OpenClawGatewayServiceRuntimeS
     || runtimeState.stateChangeTimestampMonotonic !== null;
 }
 
-async function waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState: OpenClawGatewayServiceRuntimeState) {
+async function probeGatewayRestartReadinessStatus() {
+  return probeGatewayConnectionStatus(buildGatewayStatusProbeParams(), {
+    preferLocalHealth: true,
+    allowRpcProbe: false,
+  });
+}
+
+function getGatewayRestartStableWindowMs(trigger: GatewayRestartTrigger | null) {
+  return trigger === 'gateway'
+    ? OPENCLAW_GATEWAY_MANUAL_RESTART_STABLE_WINDOW_MS
+    : OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS;
+}
+
+async function waitForGatewayRestartAfterBrowserModeChange(
+  previousRuntimeState: OpenClawGatewayServiceRuntimeState,
+  options?: {
+    stableWindowMs?: number;
+  },
+) {
   const deadline = Date.now() + BROWSER_HEADED_MODE_RESTART_TIMEOUT_MS;
+  const stableWindowMs = Math.max(0, options?.stableWindowMs ?? OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS);
   let restartObserved = false;
   let lastFailure = 'OpenClaw restart in progress';
 
@@ -5663,7 +5775,7 @@ async function waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState:
       throw new Error('OpenClaw gateway service failed to restart.');
     }
 
-    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    const probe = await probeGatewayRestartReadinessStatus();
     const runtimeReady = !runtimeStateKnown || runtimeStateRunning;
 
     if (!probe.connected || !runtimeReady) {
@@ -5673,7 +5785,7 @@ async function waitForGatewayRestartAfterBrowserModeChange(previousRuntimeState:
         : 'OpenClaw gateway service is still starting.');
     } else if (restartObserved) {
       await waitForGatewayConnectionStable(Math.max(0, deadline - Date.now()), {
-        minimumStableWindowMs: OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS,
+        minimumStableWindowMs: stableWindowMs,
         probeIntervalMs: BROWSER_HEADED_MODE_RESTART_POLL_INTERVAL_MS,
       });
       return;
@@ -5705,7 +5817,7 @@ async function waitForGatewayConnectionStable(
   let stableSinceMs: number | null = null;
 
   while (Date.now() < deadline) {
-    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    const probe = await probeGatewayRestartReadinessStatus();
     if (probe.connected) {
       const now = Date.now();
       if (stableSinceMs === null) {
@@ -5735,12 +5847,12 @@ async function reconcileGatewayRestartSnapshot() {
   }
 
   try {
-    const probe = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    const probe = await probeGatewayRestartReadinessStatus();
     if (probe.connected) {
       const now = Date.now();
       if (gatewayRestartReconcileStableSinceMs === null) {
         gatewayRestartReconcileStableSinceMs = now;
-      } else if ((now - gatewayRestartReconcileStableSinceMs) >= OPENCLAW_GATEWAY_RESTART_STABLE_WINDOW_MS) {
+      } else if ((now - gatewayRestartReconcileStableSinceMs) >= getGatewayRestartStableWindowMs(gatewayRestartSnapshot.trigger)) {
         resetGatewayRestartSnapshot();
       }
     } else {
@@ -5775,7 +5887,9 @@ function runTrackedGatewayRestart(options: {
   activeGatewayRestartTask = (async () => {
     try {
       await restartGatewayService();
-      await waitForGatewayRestartAfterBrowserModeChange(options.previousRuntimeState);
+      await waitForGatewayRestartAfterBrowserModeChange(options.previousRuntimeState, {
+        stableWindowMs: getGatewayRestartStableWindowMs(options.trigger),
+      });
       resetGatewayRestartSnapshot();
     } catch (error) {
       patchGatewayRestartSnapshot({
@@ -6122,7 +6236,10 @@ async function restartClawUiService() {
 
 function createStructuredChatError(rawDetail?: string | null, forcedCode?: string) {
   const detail = typeof rawDetail === 'string' && rawDetail.trim() ? rawDetail.trim() : 'Unknown error';
-  const messageCode = forcedCode || (detail === CHAT_GATEWAY_DISCONNECTED_DETAIL ? CHAT_GATEWAY_DISCONNECTED_CODE : CHAT_RUN_ERROR_CODE);
+  const messageCode = forcedCode
+    || (detail === CHAT_GATEWAY_DISCONNECTED_DETAIL
+      ? CHAT_GATEWAY_DISCONNECTED_CODE
+      : CHAT_RUN_ERROR_CODE);
 
   return {
     content: `${CHAT_RUN_ERROR_PREFIX}${detail}`,
@@ -6170,7 +6287,9 @@ function getStructuredChatMessage(content?: string | null) {
   if (!detail) return {};
 
   return {
-    messageCode: detail === CHAT_GATEWAY_DISCONNECTED_DETAIL ? CHAT_GATEWAY_DISCONNECTED_CODE : CHAT_RUN_ERROR_CODE,
+    messageCode: detail === CHAT_GATEWAY_DISCONNECTED_DETAIL
+      ? CHAT_GATEWAY_DISCONNECTED_CODE
+      : CHAT_RUN_ERROR_CODE,
     messageParams: undefined as StructuredMessageParams | undefined,
     rawDetail: detail,
     role: 'system' as const,
@@ -6390,12 +6509,14 @@ app.use((req, res, next) => {
 // transcripts for referenced audio uploads when this host has a usable audio transcription provider.
 async function prepareOutgoingMessage(
   message: string,
-  agentId: string
+  agentId: string,
+  options: { includeDocumentToolingContext?: boolean } = {},
 ): Promise<{ text: string; attachments: { type: string; mimeType: string; content: string }[] }> {
   const workspacePath = agentProvisioner.getWorkspacePath(agentId);
   const absoluteUploadsDir = path.join(workspacePath, 'uploads');
   const rewritten = rewriteMessageWithWorkspaceUploads(message, absoluteUploadsDir, { extractImageAttachments: true });
-  if (readMaxPermissionsEnabled() === true && hasDocumentUploads(rewritten.linkedUploads)) {
+  const includeDocumentToolingContext = options.includeDocumentToolingContext !== false;
+  if (includeDocumentToolingContext && readMaxPermissionsEnabled() === true && hasDocumentUploads(rewritten.linkedUploads)) {
     try {
       await ensureManagedDocumentToolingReady();
     } catch (error) {
@@ -6403,7 +6524,7 @@ async function prepareOutgoingMessage(
     }
   }
   const imageInspectionContext = buildImageUploadInspectionContext(rewritten.linkedUploads);
-  const documentToolingContext = buildDocumentToolingContext(rewritten.linkedUploads);
+  const documentToolingContext = includeDocumentToolingContext ? buildDocumentToolingContext(rewritten.linkedUploads) : '';
   const transcripts = await prepareAudioTranscriptsFromUploads(rewritten.linkedUploads, agentId);
   const audioTranscriptContext = buildAudioTranscriptContext(transcripts);
 
@@ -6411,6 +6532,307 @@ async function prepareOutgoingMessage(
     text: [rewritten.text, imageInspectionContext, documentToolingContext, audioTranscriptContext].filter(Boolean).join('\n\n').trim(),
     attachments: rewritten.attachments,
   };
+}
+
+function readEffectiveAgentRuntimeSettings(sessionInfo: SessionRow | undefined, agentId: string): {
+  runtimeMode: AgentRuntimeMode;
+  systemPromptMode: AgentSystemPromptMode;
+  toolMode: AgentToolMode;
+} {
+  const openClawRuntime = agentProvisioner.readAgentRuntimeConfig(agentId);
+  return {
+    runtimeMode: normalizeAgentRuntimeMode(sessionInfo?.runtime_mode),
+    systemPromptMode: openClawRuntime.systemPromptMode,
+    toolMode: openClawRuntime.toolMode,
+  };
+}
+
+function shouldInjectHostTakeoverInstruction(sessionInfo: SessionRow | undefined, agentId: string): boolean {
+  if (readMaxPermissionsEnabled() !== true) return false;
+  const runtimeSettings = readEffectiveAgentRuntimeSettings(sessionInfo, agentId);
+  if (runtimeSettings.runtimeMode === 'direct') return false;
+  return runtimeSettings.toolMode === 'full' || runtimeSettings.toolMode === 'coding';
+}
+
+function buildDirectChatRequestUrl(endpoint: ImageGenerationEndpointModelSnapshot): string {
+  return `${endpoint.baseUrl.replace(/\/+$/, '')}/chat/completions`;
+}
+
+function buildDirectModelRequestHeaders(endpoint: ImageGenerationEndpointModelSnapshot): Record<string, string> {
+  const headers: Record<string, string> = {
+    ...(endpoint.headers || {}),
+    'Content-Type': 'application/json',
+  };
+
+  const authHeader = endpoint.authHeader || 'Authorization';
+  if (!hasHeader(headers, authHeader)) {
+    headers[authHeader] = authHeader.toLowerCase() === 'authorization'
+      ? `Bearer ${endpoint.apiKey}`
+      : endpoint.apiKey;
+  }
+
+  return headers;
+}
+
+function sanitizeDirectModelErrorDetail(detail: string, endpoint?: ImageGenerationEndpointModelSnapshot): string {
+  const normalized = normalizeCliText(detail);
+  if (!normalized) return 'Direct model request failed.';
+
+  let sanitized = normalized;
+  const secret = endpoint?.apiKey;
+  if (secret && secret.length >= 6) {
+    sanitized = sanitized.split(secret).join('[redacted]');
+  }
+
+  return sanitized.length > 2000 ? `${sanitized.slice(0, 2000)}...` : sanitized;
+}
+
+async function readDirectModelErrorDetail(response: Response, endpoint: ImageGenerationEndpointModelSnapshot): Promise<string> {
+  const bodyText = await response.text().catch(() => '');
+  let bodyDetail = bodyText.trim();
+  try {
+    const parsed = JSON.parse(bodyText);
+    bodyDetail = normalizeCliText(parsed?.error?.message)
+      || normalizeCliText(parsed?.message)
+      || normalizeCliText(parsed?.detail)
+      || normalizeCliText(parsed?.error)
+      || bodyDetail;
+  } catch {}
+
+  return sanitizeDirectModelErrorDetail(
+    `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}${bodyDetail ? ` - ${bodyDetail}` : ''}`,
+    endpoint,
+  );
+}
+
+function normalizeDirectModelText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) {
+    return value
+      .map((part) => {
+        if (typeof part === 'string') return part;
+        if (typeof part?.text === 'string') return part.text;
+        if (typeof part?.content === 'string') return part.content;
+        return '';
+      })
+      .filter(Boolean)
+      .join('');
+  }
+  if (typeof (value as any)?.text === 'string') return (value as any).text;
+  if (typeof (value as any)?.content === 'string') return (value as any).content;
+  return '';
+}
+
+function extractDirectModelDeltaText(payload: any): string {
+  const choice = Array.isArray(payload?.choices) ? payload.choices[0] : null;
+  return normalizeDirectModelText(choice?.delta?.content)
+    || normalizeDirectModelText(choice?.message?.content)
+    || normalizeDirectModelText(payload?.delta?.content)
+    || normalizeDirectModelText(payload?.content);
+}
+
+function buildDirectChatMessages(params: {
+  sessionId: string;
+  agentId: string;
+  userMessageId: number;
+  assistantMessageId: number;
+  currentUserText: string;
+  attachments: { type: string; mimeType: string; content: string }[];
+}): Array<{ role: 'system' | 'user' | 'assistant'; content: any }> {
+  const messages: Array<{ role: 'system' | 'user' | 'assistant'; content: any }> = [];
+  const systemPrompt = agentProvisioner.buildAgentSystemPromptOverride(params.agentId).trim();
+  if (systemPrompt) {
+    messages.push({ role: 'system', content: systemPrompt });
+  }
+
+  const history = db.getMessages(params.sessionId, 40);
+  for (const row of history) {
+    if (row.id === params.assistantMessageId) continue;
+    if (row.role !== 'user' && row.role !== 'assistant') continue;
+
+    let content = row.id === params.userMessageId ? params.currentUserText : row.content;
+    content = normalizeCliText(content);
+    if (!content) continue;
+
+    if (row.role === 'user' && row.id === params.userMessageId && params.attachments.length > 0) {
+      messages.push({
+        role: 'user',
+        content: [
+          { type: 'text', text: content },
+          ...params.attachments
+            .filter((attachment) => attachment.type === 'image' && attachment.content)
+            .map((attachment) => ({
+              type: 'image_url',
+              image_url: {
+                url: `data:${attachment.mimeType || 'image/png'};base64,${attachment.content}`,
+              },
+            })),
+        ],
+      });
+      continue;
+    }
+
+    messages.push({ role: row.role, content });
+  }
+
+  return messages;
+}
+
+async function runDirectChatCompletion(params: {
+  sessionId: string;
+  agentId: string;
+  userMessageId: number;
+  assistantMessageId: number;
+  message: string;
+  modelUsed: string;
+  response: ExpressResponse;
+  processStartTag?: string;
+  processEndTag?: string;
+  sessionInterruptionEpoch: number;
+}): Promise<void> {
+  const endpoint = agentProvisioner.readEndpointModel(params.modelUsed);
+  if (!endpoint) {
+    throw new Error(`Direct runtime model is not configured: ${params.modelUsed}`);
+  }
+  if (!endpoint.api.toLowerCase().includes('openai')) {
+    throw new Error(`Direct runtime currently supports OpenAI-compatible chat endpoints only: ${endpoint.api}`);
+  }
+
+  const outgoingMessage = await prepareOutgoingMessage(params.message, params.agentId, {
+    includeDocumentToolingContext: false,
+  });
+  const messages = buildDirectChatMessages({
+    sessionId: params.sessionId,
+    agentId: params.agentId,
+    userMessageId: params.userMessageId,
+    assistantMessageId: params.assistantMessageId,
+    currentUserText: outgoingMessage.text,
+    attachments: outgoingMessage.attachments,
+  });
+  if (messages.length === 0) {
+    throw new Error('Direct runtime has no message content to send.');
+  }
+
+  const controller = new AbortController();
+  let rawText = '';
+  let lastVisibleText = '';
+  let lastVisibleProcessContent = '';
+  let lastVisibleProcessStreaming = false;
+
+  const emitSnapshot = (type: 'delta' | 'final') => {
+    const split = splitChatProcessOutput(rawText, params.processStartTag, params.processEndTag);
+    const visibleText = rewriteOpenClawMediaPaths(split.finalContent, getSessionWorkspacePath(params.sessionId));
+    const visibleProcessContent = rewriteOpenClawMediaPaths(split.processContent, getSessionWorkspacePath(params.sessionId));
+    const visibleProcessStreaming = type === 'final' ? false : split.processStreaming;
+    const changed = visibleText !== lastVisibleText
+      || visibleProcessContent !== lastVisibleProcessContent
+      || visibleProcessStreaming !== lastVisibleProcessStreaming;
+
+    if (type === 'delta' && !changed) return;
+
+    lastVisibleText = visibleText;
+    lastVisibleProcessContent = visibleProcessContent;
+    lastVisibleProcessStreaming = visibleProcessStreaming;
+    db.updateMessage(params.assistantMessageId, visibleText, params.modelUsed, visibleProcessContent);
+    params.response.write(`data: ${JSON.stringify({
+      type,
+      text: visibleText,
+      process_content: visibleProcessContent,
+      process_streaming: visibleProcessStreaming,
+      modelUsed: params.modelUsed,
+      model_used: params.modelUsed,
+    })}\n\n`);
+  };
+
+  try {
+    assertSessionInterruptionEpoch(params.sessionId, params.sessionInterruptionEpoch);
+    const response = await fetch(buildDirectChatRequestUrl(endpoint), {
+      method: 'POST',
+      headers: buildDirectModelRequestHeaders(endpoint),
+      body: JSON.stringify({
+        model: endpoint.modelName,
+        messages,
+        stream: true,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      throw new Error(await readDirectModelErrorDetail(response, endpoint));
+    }
+
+    if (!response.body) {
+      const payload = await response.json().catch(() => null) as any;
+      rawText = normalizeDirectModelText(payload?.choices?.[0]?.message?.content);
+      if (!rawText.trim()) {
+        throw new Error('Direct runtime returned an empty response.');
+      }
+      emitSnapshot('final');
+      params.response.end();
+      return;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      assertSessionInterruptionEpoch(params.sessionId, params.sessionInterruptionEpoch);
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      let boundary = buffer.indexOf('\n\n');
+      while (boundary >= 0) {
+        const eventBlock = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+
+        for (const line of eventBlock.split('\n')) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data:')) continue;
+          const data = trimmed.slice(5).trim();
+          if (!data) continue;
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            const delta = extractDirectModelDeltaText(parsed);
+            if (delta) {
+              rawText += delta;
+              emitSnapshot('delta');
+            }
+          } catch {}
+        }
+
+        boundary = buffer.indexOf('\n\n');
+      }
+    }
+
+    if (buffer.trim()) {
+      for (const line of buffer.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('data:')) continue;
+        const data = trimmed.slice(5).trim();
+        if (!data || data === '[DONE]') continue;
+        try {
+          const parsed = JSON.parse(data);
+          const delta = extractDirectModelDeltaText(parsed);
+          if (delta) rawText += delta;
+        } catch {}
+      }
+    }
+
+    if (!rawText.trim()) {
+      throw new Error('Direct runtime returned an empty response.');
+    }
+
+    assertSessionInterruptionEpoch(params.sessionId, params.sessionInterruptionEpoch);
+    emitSnapshot('final');
+    params.response.end();
+  } catch (error) {
+    controller.abort();
+    throw error;
+  }
 }
 
 const AGENT_WORKSPACE_RESET_PRESERVED_ROOT_ENTRIES = new Set([
@@ -7304,6 +7726,7 @@ async function prepareGroupRuntimeAgent(groupId: string, sourceAgentId: string):
   const runtimeAgentId = getGroupRuntimeAgentId(groupId, sourceAgentId);
   const runtimeWorkspacePath = agentProvisioner.getWorkspacePath(sourceAgentId);
   const sourceModelConfig = agentProvisioner.readAgentModelConfig(sourceAgentId);
+  const sourceRuntimeConfig = agentProvisioner.readAgentRuntimeConfig(sourceAgentId);
 
   cleanupLegacyGroupRuntimeArtifacts(groupId);
   removeGroupWorkspaceBootstrapFiles(groupId);
@@ -7324,6 +7747,8 @@ async function prepareGroupRuntimeAgent(groupId: string, sourceAgentId: string):
     model: sourceModelConfig.modelOverride || undefined,
     fallbackMode: sourceModelConfig.fallbackMode,
     fallbacks: sourceModelConfig.fallbacks,
+    systemPromptMode: sourceRuntimeConfig.systemPromptMode,
+    toolMode: sourceRuntimeConfig.toolMode,
   });
 
   return {
@@ -7673,7 +8098,7 @@ app.get('/api/gateway/status', async (_req, res) => {
       });
     }
 
-    const result = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams());
+    const result = await probeGatewayConnectionStatus(buildGatewayStatusProbeParams(), { preferLocalHealth: true });
     res.json({
       connected: result.connected,
       message: result.message,
@@ -7906,8 +8331,15 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
     await configureMaxPermissionsState(true);
     reportRepairProgress('sync-browser-settings');
     synchronizeConfiguredBrowserRepairSettings();
+    reportRepairProgress('refresh-plugins');
+    try {
+      await refreshOpenClawPluginRegistryForBrowserSelfHeal();
+    } catch (error) {
+      reportRepairProgress('refresh-plugins', readCliErrorDetail(error) || (error instanceof Error ? error.message : String(error)));
+    }
     reportRepairProgress('restart-gateway');
     await restartGatewayService();
+    await waitForBrowserGatewayReady(BROWSER_SELF_HEAL_GATEWAY_READY_TIMEOUT_MS, reportRepairProgress);
     reportRepairProgress('stop-browser');
     await stopOpenClawBrowserBestEffort();
 
@@ -7929,11 +8361,13 @@ app.post('/api/config/browser-health/self-heal', async (_req, res) => {
     }
 
     reportRepairProgress('finalize');
+    const health = await runBrowserHealthCheck(reportRepairProgress);
 
     res.json({
       success: true,
       gatewayRestarted: true,
       resetProfile: shouldResetProfile,
+      health,
     });
   } catch (error: any) {
     if (isStructuredRequestError(error)) {
@@ -8610,8 +9044,12 @@ app.put('/api/characters/:agentId/user-md', (req, res) => {
 app.get('/api/sessions', (_req, res) => {
   const sessions = sessionManager.getAllSessions();
   const sessionsWithModel = sessions.map(session => {
+    const runtimeSettings = readEffectiveAgentRuntimeSettings(session, session.agentId);
     return {
       ...session,
+      runtimeMode: runtimeSettings.runtimeMode,
+      systemPromptMode: runtimeSettings.systemPromptMode,
+      toolMode: runtimeSettings.toolMode,
       model: agentProvisioner.readAgentModel(session.agentId) || ''
     };
   });
@@ -8622,6 +9060,9 @@ app.post('/api/sessions', async (req, res) => {
   const { id, name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model, process_start_tag, process_end_tag } = req.body;
   const fallbackMode = normalizeFallbackMode(req.body?.fallbackMode) ?? 'inherit';
   const fallbacks = normalizeFallbackList(req.body?.fallbacks);
+  const runtimeMode = normalizeAgentRuntimeMode(req.body?.runtimeMode ?? req.body?.runtime_mode);
+  const systemPromptMode = normalizeAgentSystemPromptMode(req.body?.systemPromptMode ?? req.body?.system_prompt_mode);
+  const toolMode = normalizeAgentToolMode(req.body?.toolMode ?? req.body?.tool_mode);
 
   const rawId = typeof id === 'string' ? id : '';
   const normalizedId = rawId.trim();
@@ -8640,7 +9081,15 @@ app.post('/api/sessions', async (req, res) => {
 
   try {
     // Provide basic default for first session if it doesn't exist
-    const newSession = sessionManager.createSession({ id: normalizedId, name, process_start_tag, process_end_tag });
+    const newSession = sessionManager.createSession({
+      id: normalizedId,
+      name,
+      process_start_tag,
+      process_end_tag,
+      runtime_mode: runtimeMode,
+      system_prompt_mode: systemPromptMode,
+      tool_mode: toolMode,
+    });
     const agentId = newSession.id;
 
     // Provision agent workspace
@@ -8655,6 +9104,8 @@ app.post('/api/sessions', async (req, res) => {
       model,
       fallbackMode,
       fallbacks,
+      systemPromptMode,
+      toolMode,
     });
     
     // Update session record with the auto-generated agentId
@@ -8671,6 +9122,9 @@ app.put('/api/sessions/:id', async (req, res) => {
   const { name, soulContent, userContent, agentsContent, toolsContent, heartbeatContent, identityContent, model, process_start_tag, process_end_tag } = req.body;
   const fallbackMode = normalizeFallbackMode(req.body?.fallbackMode) ?? 'inherit';
   const fallbacks = normalizeFallbackList(req.body?.fallbacks);
+  const runtimeMode = normalizeAgentRuntimeMode(req.body?.runtimeMode ?? req.body?.runtime_mode);
+  const systemPromptMode = normalizeAgentSystemPromptMode(req.body?.systemPromptMode ?? req.body?.system_prompt_mode);
+  const toolMode = normalizeAgentToolMode(req.body?.toolMode ?? req.body?.tool_mode);
   const session = sessionManager.getSession(req.params.id);
   
   if (!session) {
@@ -8678,7 +9132,14 @@ app.put('/api/sessions/:id', async (req, res) => {
   }
 
   try {
-    const updated = sessionManager.updateSession(req.params.id, { name, process_start_tag, process_end_tag });
+    const updated = sessionManager.updateSession(req.params.id, {
+      name,
+      process_start_tag,
+      process_end_tag,
+      runtime_mode: runtimeMode,
+      system_prompt_mode: systemPromptMode,
+      tool_mode: toolMode,
+    });
     
     if (session.agentId) {
       await agentProvisioner.updateSoul(session.agentId, soulContent || '');
@@ -8690,6 +9151,7 @@ app.put('/api/sessions/:id', async (req, res) => {
       
       // Model update might require gateway restart
       const modelChanged = await agentProvisioner.updateModel(session.agentId, model, { mode: fallbackMode, fallbacks });
+      agentProvisioner.updateAgentRuntimeConfig(session.agentId, { systemPromptMode, toolMode });
       if (modelChanged) {
         // Gateway auto-reloads config
       }
@@ -8718,6 +9180,17 @@ app.delete('/api/sessions/:id', async (req, res) => {
   try {
     await activeRunManager.abortRun(req.params.id);
   } catch {}
+  try {
+    const client = await getConnection(req.params.id);
+    await abortOpenClawSessionRuns(
+      client,
+      buildOpenClawChatSessionKey(req.params.id, agentId || 'main'),
+      `session ${req.params.id} delete`,
+      { retryOnMiss: true },
+    );
+  } catch (error) {
+    console.warn(`[chat] Failed to abort orphan OpenClaw runs while deleting session ${req.params.id}:`, error);
+  }
   disconnectConnection(req.params.id);
   const success = sessionManager.deleteSession(req.params.id);
   
@@ -8751,6 +9224,17 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
     try {
       await activeRunManager.abortRun(req.params.id);
     } catch {}
+    try {
+      const client = await getConnection(req.params.id);
+      await abortOpenClawSessionRuns(
+        client,
+        buildOpenClawChatSessionKey(req.params.id, agentId || 'main'),
+        `session ${req.params.id} reset`,
+        { retryOnMiss: true },
+      );
+    } catch (error) {
+      console.warn(`[chat] Failed to abort orphan OpenClaw runs while resetting session ${req.params.id}:`, error);
+    }
     disconnectConnection(req.params.id);
 
     // Clear database records
@@ -8761,6 +9245,7 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
     if (agentId) {
       const workspacePath = agentProvisioner.getWorkspacePath(agentId);
       const modelConfig = agentProvisioner.readAgentModelConfig(agentId);
+      const runtimeConfig = agentProvisioner.readAgentRuntimeConfig(agentId);
       resetAgentWorkspaceToInitialState(workspacePath);
       resetAgentRuntimeStateToInitialState(agentId);
       await agentProvisioner.provision({
@@ -8769,6 +9254,8 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
         model: modelConfig.modelOverride || undefined,
         fallbackMode: modelConfig.fallbackMode,
         fallbacks: modelConfig.fallbacks,
+        systemPromptMode: runtimeConfig.systemPromptMode,
+        toolMode: runtimeConfig.toolMode,
       });
     }
 
@@ -8780,7 +9267,7 @@ app.post('/api/sessions/:id/reset', async (req, res) => {
 });
 
 // Endpoint to fetch all configuring MD files for a given session's agent
-app.get('/api/sessions/:id/configs', (req, res) => {
+app.get('/api/sessions/:id/configs', async (req, res) => {
   const session = sessionManager.getSession(req.params.id);
   if (!session) {
     return res.status(404).json({ success: false, error: 'Session not found' });
@@ -8788,6 +9275,8 @@ app.get('/api/sessions/:id/configs', (req, res) => {
   
   const agentId = session.agentId;
   const modelConfig = agentProvisioner.readAgentModelConfig(agentId);
+  const runtimeSettings = readEffectiveAgentRuntimeSettings(session, agentId);
+  const runtimeMetrics = agentProvisioner.readAgentRuntimeMetrics(agentId);
   res.json({
     success: true,
     configs: {
@@ -8802,6 +9291,10 @@ app.get('/api/sessions/:id/configs', (req, res) => {
       resolvedModel: modelConfig.resolvedModel,
       fallbackMode: modelConfig.fallbackMode,
       fallbacks: modelConfig.fallbacks,
+      runtimeMode: runtimeSettings.runtimeMode,
+      systemPromptMode: runtimeSettings.systemPromptMode,
+      toolMode: runtimeSettings.toolMode,
+      runtimeMetrics,
     }
   });
 });
@@ -9062,10 +9555,31 @@ class ActiveRunManager {
       return { aborted: false };
     }
 
-    const result = await run.clientRef.abortChat({
-      sessionKey: run.finalSessionKey,
-      runId: run.runId,
-    });
+    const clientRef = run.clientRef;
+    let aborted = false;
+    try {
+      const result = await clientRef.abortChat({
+        sessionKey: run.finalSessionKey,
+        runId: run.runId,
+        timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
+      });
+      aborted = result.aborted;
+      if (!result.aborted) {
+        scheduleOpenClawSessionAbortRetry(
+          clientRef,
+          run.finalSessionKey,
+          `active run ${run.runId} for session ${sessionId}`,
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`[chat] Failed to abort active OpenClaw run ${run.runId} for session ${sessionId}: ${detail}`);
+      scheduleOpenClawSessionAbortRetry(
+        clientRef,
+        run.finalSessionKey,
+        `active run ${run.runId} for session ${sessionId}`,
+      );
+    }
 
     const canonicalText = canonicalizeAssistantWorkspaceArtifacts(run.text || '', {
       workspacePath: run.workspacePath,
@@ -9086,7 +9600,7 @@ class ActiveRunManager {
     });
 
     this.cleanupRun(run);
-    return { aborted: result.aborted };
+    return { aborted };
   }
 
   private applyRawTextSnapshot(
@@ -9440,6 +9954,7 @@ class ActiveRunManager {
       
       this.db.updateMessage(run.messageId, rewritten, run.modelUsed, rewrittenProcessContent);
       this.emitVisibleFinal(run, finalText, { end: true });
+      this.abortUnderlyingRunBestEffort(run, 'idle timeout');
       this.cleanupRun(run);
     }, 600000); // 10 minutes
   }
@@ -9452,6 +9967,16 @@ class ActiveRunManager {
       || sessionKey === run.sessionId
       || sessionKey.endsWith(`:${run.sessionId}`)
       || sessionKey.includes(`:chat:${run.sessionId}`);
+  }
+
+  private hasAnyRunEvidence(run: ActiveRun) {
+    return !!(
+      run.rawText.trim()
+      || run.finalEventText?.trim()
+      || run.processContent.trim()
+      || run.pendingErrorDetail?.trim()
+      || run.lastObservedHistoryActivityAt !== undefined
+    );
   }
 
   private scheduleCompletionProbe(run: ActiveRun, delay = CHAT_STREAM_COMPLETION_PROBE_DELAY_MS) {
@@ -9713,10 +10238,12 @@ class ActiveRunManager {
     this.cleanupRun(run);
   }
 
-  private failRun(run: ActiveRun, detail: string) {
+  private failRun(run: ActiveRun, detail: string, options?: {
+    messageCode?: string;
+  }) {
     if (!this.isCurrentRun(run)) return;
 
-    const structuredError = createStructuredChatError(detail);
+    const structuredError = createStructuredChatError(detail, options?.messageCode);
 
     run.processStreaming = false;
     this.db.updateMessage(run.messageId, structuredError.content, run.modelUsed, run.processContent);
@@ -9735,7 +10262,39 @@ class ActiveRunManager {
       })}\n\n`);
       res.end();
     });
+    this.abortUnderlyingRunBestEffort(run, detail);
     this.cleanupRun(run);
+  }
+
+  private abortUnderlyingRunBestEffort(run: ActiveRun, reason: string) {
+    if (!run.clientRef || !run.finalSessionKey || !run.runId) {
+      return;
+    }
+
+    const clientRef = run.clientRef;
+    void clientRef.abortChat({
+      sessionKey: run.finalSessionKey,
+      runId: run.runId,
+      timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
+    }).then((result) => {
+      if (!result.aborted) {
+        scheduleOpenClawSessionAbortRetry(
+          clientRef,
+          run.finalSessionKey,
+          `run ${run.runId} for session ${run.sessionId} after ${reason}`,
+        );
+      }
+    }).catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[chat] Failed to abort OpenClaw run ${run.runId} for session ${run.sessionId} after ${reason}: ${detail}`,
+      );
+      scheduleOpenClawSessionAbortRetry(
+        clientRef,
+        run.finalSessionKey,
+        `run ${run.runId} for session ${run.sessionId} after ${reason}`,
+      );
+    });
   }
 
   private cleanupRun(run: ActiveRun) {
@@ -9807,19 +10366,60 @@ async function interruptSessionStreamingStateForNewRun(sessionId: string): Promi
   return nextEpoch;
 }
 
-async function abortOpenClawSessionRuns(client: OpenClawClient, sessionKey: string, context: string): Promise<{ aborted: boolean; runIds: string[] }> {
+function scheduleOpenClawSessionAbortRetry(
+  client: OpenClawClient,
+  sessionKey: string,
+  context: string,
+  attempt = 0,
+) {
+  if (attempt >= CHAT_ABORT_RETRY_DELAYS_MS.length) {
+    console.warn(`[chat] Exhausted OpenClaw abort retries for ${context} (${sessionKey}).`);
+    return;
+  }
+
+  const delay = CHAT_ABORT_RETRY_DELAYS_MS[attempt];
+  const timer = setTimeout(() => {
+    void client.abortChat({
+      sessionKey,
+      timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
+    }).then((result) => {
+      if (result.aborted) {
+        return;
+      }
+      scheduleOpenClawSessionAbortRetry(client, sessionKey, context, attempt + 1);
+    }).catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      console.warn(`[chat] OpenClaw abort retry ${attempt + 1} failed for ${context} (${sessionKey}): ${detail}`);
+      scheduleOpenClawSessionAbortRetry(client, sessionKey, context, attempt + 1);
+    });
+  }, delay);
+  timer.unref?.();
+}
+
+async function abortOpenClawSessionRuns(
+  client: OpenClawClient,
+  sessionKey: string,
+  context: string,
+  options?: { retryOnMiss?: boolean },
+): Promise<{ aborted: boolean; runIds: string[] }> {
   try {
     const result = await client.abortChat({
       sessionKey,
       timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
     });
     const runIds = Array.isArray(result.runIds) ? result.runIds : [];
+    if (!result.aborted && options?.retryOnMiss) {
+      scheduleOpenClawSessionAbortRetry(client, sessionKey, context);
+    }
     return {
       aborted: result.aborted,
       runIds,
     };
   } catch (error) {
     console.warn(`[chat] Failed to abort orphan OpenClaw runs for ${context} (${sessionKey}):`, error);
+    if (options?.retryOnMiss) {
+      scheduleOpenClawSessionAbortRetry(client, sessionKey, context);
+    }
     return {
       aborted: false,
       runIds: [],
@@ -10053,6 +10653,7 @@ app.post('/api/chat', async (req, res) => {
     let injectedInstructions = '';
 
     const agentId = sessionInfo?.agentId || 'main';
+    const runtimeSettings = readEffectiveAgentRuntimeSettings(sessionInfo, agentId);
     const allCharacters = db.getCharacters();
     const character = allCharacters.find(c => c.agentId === agentId);
     const agentName = sessionInfo?.name || character?.name || agentId;
@@ -10068,7 +10669,7 @@ app.post('/api/chat', async (req, res) => {
         injectedInstructions += `【极其重要：输出格式规范】\n当前启用了结构化思考输出。你关于后续任务决断的所有内部思考、分析或工作执行过程，必须严格包裹在 ${sessionInfo.process_start_tag} 和 ${sessionInfo.process_end_tag} 之间！\n真正的最终沟通、回复语言写在标签外部。\n\n`;
       }
     }
-    if (readMaxPermissionsEnabled() === true) {
+    if (shouldInjectHostTakeoverInstruction(sessionInfo, agentId)) {
       injectedInstructions += `${buildHostTakeoverChatInstruction()}\n\n`;
     }
 
@@ -10184,6 +10785,22 @@ app.post('/api/chat', async (req, res) => {
       return;
     }
 
+    if (runtimeSettings.runtimeMode === 'direct') {
+      await runDirectChatCompletion({
+        sessionId: normalizedSessionId,
+        agentId,
+        userMessageId: userMsgId,
+        assistantMessageId: assistantMsgId,
+        message: finalMessage,
+        modelUsed,
+        response: res,
+        processStartTag: sessionInfo?.process_start_tag || undefined,
+        processEndTag: sessionInfo?.process_end_tag || undefined,
+        sessionInterruptionEpoch,
+      });
+      return;
+    }
+
     pendingChatPreparationManager.start({
       sessionId: normalizedSessionId,
       epoch: sessionInterruptionEpoch,
@@ -10211,7 +10828,9 @@ app.post('/api/chat', async (req, res) => {
     } catch (error) {
       console.warn(`[chat] Failed to subscribe session events for session ${normalizedSessionId}:`, error);
     }
-    const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
+    const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId, {
+      includeDocumentToolingContext: runtimeSettings.toolMode === 'full' || runtimeSettings.toolMode === 'coding',
+    });
     assertSessionInterruptionEpoch(normalizedSessionId, sessionInterruptionEpoch);
 
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
@@ -10227,8 +10846,17 @@ app.post('/api/chat', async (req, res) => {
     });
     if (getSessionInterruptionEpoch(normalizedSessionId) !== sessionInterruptionEpoch) {
       try {
-        await client.abortChat({ sessionKey: finalSessionKey, runId });
-      } catch {}
+        const abortResult = await client.abortChat({
+          sessionKey: finalSessionKey,
+          runId,
+          timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
+        });
+        if (!abortResult.aborted) {
+          scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${normalizedSessionId}`);
+        }
+      } catch {
+        scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${normalizedSessionId}`);
+      }
       throw new SessionInterruptedError(normalizedSessionId);
     }
 
@@ -10399,15 +11027,16 @@ app.post('/api/chat/regenerate', async (req, res) => {
         injectedInstructions += `【极其重要：输出格式规范】\n当前启用了结构化思考输出。你关于后续任务决断的所有内部思考、分析或工作执行过程，必须严格包裹在 ${sessionInfo.process_start_tag} 和 ${sessionInfo.process_end_tag} 之间！\n真正的最终沟通、回复语言写在标签外部。\n\n`;
       }
     }
-    if (readMaxPermissionsEnabled() === true) {
+    const agentId = sessionInfo?.agentId || 'main';
+    const runtimeSettings = readEffectiveAgentRuntimeSettings(sessionInfo, agentId);
+
+    if (shouldInjectHostTakeoverInstruction(sessionInfo, agentId)) {
       injectedInstructions += `${buildHostTakeoverChatInstruction()}\n\n`;
     }
 
     if (injectedInstructions) {
       finalMessage = `${injectedInstructions}${finalMessage}`;
     }
-
-    const agentId = sessionInfo?.agentId || 'main';
 
     const allCharacters = db.getCharacters();
     const character = allCharacters.find(c => c.agentId === agentId);
@@ -10473,6 +11102,22 @@ app.post('/api/chat/regenerate', async (req, res) => {
       return;
     }
 
+    if (runtimeSettings.runtimeMode === 'direct') {
+      await runDirectChatCompletion({
+        sessionId: String(sessionId),
+        agentId,
+        userMessageId: numericParentId,
+        assistantMessageId: assistantMsgId,
+        message: finalMessage,
+        modelUsed,
+        response: res,
+        processStartTag: sessionInfo?.process_start_tag || undefined,
+        processEndTag: sessionInfo?.process_end_tag || undefined,
+        sessionInterruptionEpoch,
+      });
+      return;
+    }
+
     pendingChatPreparationManager.start({
       sessionId,
       epoch: sessionInterruptionEpoch,
@@ -10500,7 +11145,9 @@ app.post('/api/chat/regenerate', async (req, res) => {
     } catch (error) {
       console.warn(`[chat] Failed to subscribe session events for session ${sessionId}:`, error);
     }
-    const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId);
+    const outgoingMessage = await prepareOutgoingMessage(finalMessage, agentId, {
+      includeDocumentToolingContext: runtimeSettings.toolMode === 'full' || runtimeSettings.toolMode === 'coding',
+    });
     assertSessionInterruptionEpoch(sessionId, sessionInterruptionEpoch);
 
     const preRunHistorySnapshot = await client.getChatHistory(expectedSessionKey, CHAT_HISTORY_COMPLETION_PROBE_LIMIT)
@@ -10516,8 +11163,17 @@ app.post('/api/chat/regenerate', async (req, res) => {
     });
     if (getSessionInterruptionEpoch(sessionId) !== sessionInterruptionEpoch) {
       try {
-        await client.abortChat({ sessionKey: finalSessionKey, runId });
-      } catch {}
+        const abortResult = await client.abortChat({
+          sessionKey: finalSessionKey,
+          runId,
+          timeoutMs: CHAT_ORPHAN_ABORT_TIMEOUT_MS,
+        });
+        if (!abortResult.aborted) {
+          scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${sessionId}`);
+        }
+      } catch {
+        scheduleOpenClawSessionAbortRetry(client, finalSessionKey, `interrupted session ${sessionId}`);
+      }
       throw new SessionInterruptedError(sessionId);
     }
 
@@ -10680,6 +11336,7 @@ app.post('/api/chat/stop', async (req, res) => {
         client,
         buildOpenClawChatSessionKey(normalizedSessionId, agentId),
         `session ${normalizedSessionId} stop`,
+        { retryOnMiss: true },
       );
     } catch (error) {
       console.warn(`[chat] Failed to abort orphan OpenClaw runs while stopping session ${normalizedSessionId}:`, error);
@@ -11195,6 +11852,9 @@ const groupChatEngine = new GroupChatEngine(db, getConnection, (agentId) => {
 }, prepareGroupRuntimeAgent, tryGenerateImageForPrompt, () => {
   const modelId = getConfiguredDirectImageGenerationModel();
   return modelId ? buildImageGenerationStartProcessContent(modelId) : null;
+}, (agentId) => {
+  const sessionInfo = db.getSessionByAgentId(agentId) || db.getSession(agentId);
+  return shouldInjectHostTakeoverInstruction(sessionInfo, agentId);
 });
 
 // SSE clients per group

@@ -70,6 +70,10 @@ export type MessageSearchMatch = {
   anchorBeforeId: number | null;
 };
 
+export type AgentRuntimeMode = 'configured' | 'direct';
+export type AgentSystemPromptMode = 'system' | 'agent';
+export type AgentToolMode = 'full' | 'coding' | 'messaging' | 'minimal' | 'off';
+
 export type SessionRow = {
   id: string;
   name: string;
@@ -80,6 +84,9 @@ export type SessionRow = {
   updated_at: number;
   process_start_tag?: string;
   process_end_tag?: string;
+  runtime_mode?: AgentRuntimeMode;
+  system_prompt_mode?: AgentSystemPromptMode;
+  tool_mode?: AgentToolMode;
 };
 
 export type CharacterRow = {
@@ -173,6 +180,9 @@ export class DB {
         agentId TEXT NOT NULL,
         characterId TEXT,
         position INTEGER DEFAULT 0,
+        runtime_mode TEXT DEFAULT 'configured',
+        system_prompt_mode TEXT DEFAULT 'system',
+        tool_mode TEXT DEFAULT 'full',
         created_at DATETIME NOT NULL,
         updated_at DATETIME NOT NULL
       );
@@ -282,6 +292,15 @@ export class DB {
     } catch (e: any) {}
     try {
       this.db.exec("ALTER TABLE sessions ADD COLUMN process_end_tag TEXT DEFAULT ''");
+    } catch (e: any) {}
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN runtime_mode TEXT DEFAULT 'configured'");
+    } catch (e: any) {}
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN system_prompt_mode TEXT DEFAULT 'system'");
+    } catch (e: any) {}
+    try {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN tool_mode TEXT DEFAULT 'full'");
     } catch (e: any) {}
 
     try {
@@ -596,20 +615,33 @@ export class DB {
   // --- Sessions ---
   saveSession(session: SessionRow) {
     this.db
-      .prepare('INSERT INTO sessions (id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, agentId=excluded.agentId, characterId=excluded.characterId, position=excluded.position, updated_at=excluded.updated_at, process_start_tag=excluded.process_start_tag, process_end_tag=excluded.process_end_tag')
-      .run(session.id, session.name, session.agentId, session.characterId || null, session.position, session.created_at, session.updated_at, session.process_start_tag || '', session.process_end_tag || '');
+      .prepare('INSERT INTO sessions (id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag, runtime_mode, system_prompt_mode, tool_mode) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name, agentId=excluded.agentId, characterId=excluded.characterId, position=excluded.position, updated_at=excluded.updated_at, process_start_tag=excluded.process_start_tag, process_end_tag=excluded.process_end_tag, runtime_mode=excluded.runtime_mode, system_prompt_mode=excluded.system_prompt_mode, tool_mode=excluded.tool_mode')
+      .run(
+        session.id,
+        session.name,
+        session.agentId,
+        session.characterId || null,
+        session.position,
+        session.created_at,
+        session.updated_at,
+        session.process_start_tag || '',
+        session.process_end_tag || '',
+        session.runtime_mode || 'configured',
+        session.system_prompt_mode || 'system',
+        session.tool_mode || 'full',
+      );
   }
 
   getSession(id: string): SessionRow | undefined {
-    return this.db.prepare('SELECT id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
+    return this.db.prepare('SELECT id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag, runtime_mode, system_prompt_mode, tool_mode FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
   }
 
   getSessionByAgentId(agentId: string): SessionRow | undefined {
-    return this.db.prepare('SELECT id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag FROM sessions WHERE agentId = ? ORDER BY updated_at DESC LIMIT 1').get(agentId) as SessionRow | undefined;
+    return this.db.prepare('SELECT id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag, runtime_mode, system_prompt_mode, tool_mode FROM sessions WHERE agentId = ? ORDER BY updated_at DESC LIMIT 1').get(agentId) as SessionRow | undefined;
   }
 
   getSessions(): SessionRow[] {
-    return this.db.prepare('SELECT id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag FROM sessions ORDER BY position ASC, updated_at DESC').all() as SessionRow[];
+    return this.db.prepare('SELECT id, name, agentId, characterId, position, created_at, updated_at, process_start_tag, process_end_tag, runtime_mode, system_prompt_mode, tool_mode FROM sessions ORDER BY position ASC, updated_at DESC').all() as SessionRow[];
   }
 
   updateSessionPositions(orders: { id: string; position: number }[]) {

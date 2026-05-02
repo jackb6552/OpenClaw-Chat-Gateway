@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import type { AgentSystemPromptMode, AgentToolMode } from './db';
 
 const DEFAULT_USER_MD = `# User Profile
 
@@ -31,6 +32,15 @@ const NATIVE_IMAGE_GENERATION_PROVIDER_IDS = new Set([
   'vydra',
   'xai',
 ]);
+const AGENT_SYSTEM_PROMPT_FILES = [
+  'IDENTITY.md',
+  'SOUL.md',
+  'AGENTS.md',
+  'USER.md',
+  'TOOLS.md',
+  'HEARTBEAT.md',
+  'BOOTSTRAP.md',
+] as const;
 
 export interface ProvisionOptions {
   agentId: string;
@@ -44,6 +54,8 @@ export interface ProvisionOptions {
   model?: string;  // e.g. "openai/gpt-5.2" or "ark/glm-4.7"
   fallbackMode?: AgentFallbackMode;
   fallbacks?: string[];
+  systemPromptMode?: AgentSystemPromptMode;
+  toolMode?: AgentToolMode;
 }
 
 export type AgentFallbackMode = 'inherit' | 'custom' | 'disabled';
@@ -54,6 +66,23 @@ export interface AgentModelConfigSnapshot {
   fallbackMode: AgentFallbackMode;
   fallbacks: string[];
   resolvedModel: string | null;
+}
+
+export interface AgentRuntimeConfigSnapshot {
+  systemPromptMode: AgentSystemPromptMode;
+  toolMode: AgentToolMode;
+}
+
+export interface AgentRuntimeMetricsSnapshot {
+  systemPrompt: {
+    systemChars: number | null;
+    agentChars: number;
+    source: 'latest-run' | 'agent-files';
+  };
+  tools: {
+    charsByMode: Record<AgentToolMode, number | null>;
+    source: 'latest-run' | 'none';
+  };
 }
 
 export interface GlobalModelConfigSnapshot {
@@ -277,6 +306,17 @@ export class AgentProvisioner {
       normalized.push(trimmed);
     }
     return normalized;
+  }
+
+  normalizeSystemPromptMode(value: unknown): AgentSystemPromptMode {
+    return value === 'agent' ? 'agent' : 'system';
+  }
+
+  normalizeToolMode(value: unknown): AgentToolMode {
+    if (value === 'coding' || value === 'messaging' || value === 'minimal' || value === 'off') {
+      return value;
+    }
+    return 'full';
   }
 
   private getConfiguredModelIds(config: any): Set<string> {
@@ -578,6 +618,177 @@ export class AgentProvisioner {
     return { entry, created: false, workspaceChanged };
   }
 
+  private findAgentEntry(config: any, agentId: string): any | null {
+    if (!Array.isArray(config?.agents?.list)) return null;
+    return config.agents.list.find((item: any) => item?.id === agentId) || null;
+  }
+
+  private readLatestSystemPromptReport(agentId: string): any | null {
+    const sessionsPath = path.join(this.openclawDir, 'agents', agentId, 'sessions', 'sessions.json');
+    if (!fs.existsSync(sessionsPath)) return null;
+
+    try {
+      const parsed = JSON.parse(fs.readFileSync(sessionsPath, 'utf-8'));
+      const entries = (Array.isArray(parsed) ? parsed : Object.values(parsed || {}))
+        .filter((entry: any) => entry?.systemPromptReport && typeof entry.systemPromptReport === 'object');
+
+      entries.sort((left: any, right: any) => {
+        const leftTs = Number(left?.systemPromptReport?.generatedAt || left?.updatedAt || left?.updated_at || 0);
+        const rightTs = Number(right?.systemPromptReport?.generatedAt || right?.updatedAt || right?.updated_at || 0);
+        return leftTs - rightTs;
+      });
+
+      return entries.at(-1)?.systemPromptReport || null;
+    } catch (error) {
+      console.error(`[AgentProvisioner] Failed to read latest system prompt report for ${agentId}:`, error);
+      return null;
+    }
+  }
+
+  readAgentRuntimeMetrics(agentId: string, toolsCatalogResult?: any): AgentRuntimeMetricsSnapshot {
+    const report = this.readLatestSystemPromptReport(agentId);
+    const reportToolEntries = Array.isArray(report?.tools?.entries) ? report.tools.entries : [];
+    const toolEntryByName = new Map<string, { schemaChars?: number }>();
+    for (const entry of reportToolEntries) {
+      if (typeof entry?.name !== 'string') continue;
+      toolEntryByName.set(entry.name, {
+        schemaChars: typeof entry.schemaChars === 'number' ? entry.schemaChars : undefined,
+      });
+    }
+
+    const sumToolSchemaChars = (toolNames: string[]): number | null => {
+      let total = 0;
+      let matched = 0;
+      for (const toolName of toolNames) {
+        const chars = toolEntryByName.get(toolName)?.schemaChars;
+        if (typeof chars !== 'number') continue;
+        total += chars;
+        matched += 1;
+      }
+      return matched > 0 ? total : null;
+    };
+
+    const catalogTools = Array.isArray(toolsCatalogResult?.groups)
+      ? toolsCatalogResult.groups.flatMap((group: any) => Array.isArray(group?.tools) ? group.tools : [])
+      : [];
+    const toolNamesForProfile = (profile: Exclude<AgentToolMode, 'off'>): string[] => (
+      catalogTools
+        .filter((tool: any) => Array.isArray(tool?.defaultProfiles) && tool.defaultProfiles.includes(profile))
+        .map((tool: any) => typeof tool?.id === 'string' ? tool.id : '')
+        .filter(Boolean)
+    );
+
+    const fullSchemaChars = typeof report?.tools?.schemaChars === 'number'
+      ? report.tools.schemaChars
+      : (reportToolEntries.length > 0
+        ? reportToolEntries.reduce((sum: number, entry: any) => sum + (typeof entry?.schemaChars === 'number' ? entry.schemaChars : 0), 0)
+        : null);
+
+    const charsByMode: Record<AgentToolMode, number | null> = {
+      full: fullSchemaChars,
+      coding: null,
+      messaging: null,
+      minimal: null,
+      off: 0,
+    };
+
+    for (const profile of ['coding', 'messaging', 'minimal'] as const) {
+      const catalogToolNames = toolNamesForProfile(profile);
+      charsByMode[profile] = catalogToolNames.length > 0
+        ? sumToolSchemaChars(catalogToolNames)
+        : (profile === 'minimal' ? sumToolSchemaChars(['session_status']) : null);
+    }
+
+    return {
+      systemPrompt: {
+        systemChars: typeof report?.systemPrompt?.chars === 'number' ? report.systemPrompt.chars : null,
+        agentChars: this.buildAgentSystemPromptOverride(agentId).length,
+        source: report ? 'latest-run' : 'agent-files',
+      },
+      tools: {
+        charsByMode,
+        source: report ? 'latest-run' : 'none',
+      },
+    };
+  }
+
+  buildAgentSystemPromptOverride(agentId: string): string {
+    const workspaceDir = this.getWorkspacePath(agentId);
+    const sections: string[] = [];
+
+    for (const filename of AGENT_SYSTEM_PROMPT_FILES) {
+      const filePath = path.join(workspaceDir, filename);
+      if (!fs.existsSync(filePath)) continue;
+      const content = fs.readFileSync(filePath, 'utf-8').trim();
+      if (!content) continue;
+      sections.push(`## ${filename}\n\n${content}`);
+    }
+
+    if (sections.length === 0) {
+      return `# Agent ${agentId}\n\nFollow this agent's workspace instructions.`;
+    }
+
+    return [
+      `# Agent ${agentId}`,
+      'Follow this agent-specific prompt. The sections below come from this agent workspace.',
+      ...sections,
+    ].join('\n\n');
+  }
+
+  readAgentRuntimeConfig(agentId: string): AgentRuntimeConfigSnapshot {
+    const config = this.readConfigFile();
+    const entry = config ? this.findAgentEntry(config, agentId) : null;
+    const tools = entry?.tools && typeof entry.tools === 'object' ? entry.tools : null;
+    const profile = typeof tools?.profile === 'string' ? tools.profile : null;
+    const deny = Array.isArray(tools?.deny) ? tools.deny : [];
+    const hasDenyAll = deny.some((item: unknown) => typeof item === 'string' && item.trim() === '*');
+
+    return {
+      systemPromptMode: typeof entry?.systemPromptOverride === 'string' && entry.systemPromptOverride.trim()
+        ? 'agent'
+        : 'system',
+      toolMode: hasDenyAll
+        ? 'off'
+        : (profile === 'coding' || profile === 'messaging' || profile === 'minimal' ? profile : 'full'),
+    };
+  }
+
+  updateAgentRuntimeConfig(
+    agentId: string,
+    runtimeConfig: {
+      systemPromptMode?: AgentSystemPromptMode;
+      toolMode?: AgentToolMode;
+      workspaceDir?: string;
+    },
+  ): boolean {
+    const config = this.readConfigFile();
+    if (!config) return false;
+
+    const workspaceDir = runtimeConfig.workspaceDir || this.getWorkspacePath(agentId);
+    const { entry, created, workspaceChanged } = this.ensureAgentEntry(config, agentId, workspaceDir);
+    const previousSerialized = JSON.stringify(entry);
+
+    const systemPromptMode = this.normalizeSystemPromptMode(runtimeConfig.systemPromptMode);
+    if (systemPromptMode === 'agent') {
+      entry.systemPromptOverride = this.buildAgentSystemPromptOverride(agentId);
+    } else {
+      delete entry.systemPromptOverride;
+    }
+
+    const toolMode = this.normalizeToolMode(runtimeConfig.toolMode);
+    if (toolMode === 'off') {
+      entry.tools = { deny: ['*'] };
+    } else {
+      entry.tools = { profile: toolMode };
+    }
+
+    const changed = created || workspaceChanged || previousSerialized !== JSON.stringify(entry);
+    if (!changed) return false;
+
+    this.writeConfigFile(config);
+    return true;
+  }
+
   private assignModelValue(entry: any, nextValue: any): boolean {
     const prevSerialized = Object.prototype.hasOwnProperty.call(entry, 'model')
       ? JSON.stringify(entry.model)
@@ -764,7 +975,9 @@ export class AgentProvisioner {
         workspaceDir,
         opts.model,
         opts.fallbackMode,
-        opts.fallbacks
+        opts.fallbacks,
+        opts.systemPromptMode,
+        opts.toolMode,
       );
 
       if (configChanged || createdWorkspaceArtifacts || copiedAuthProfile) {
@@ -1483,6 +1696,10 @@ export class AgentProvisioner {
     };
   }
 
+  readEndpointModel(modelId: string): ImageGenerationEndpointModelSnapshot | null {
+    return this.readImageGenerationEndpointModel(modelId);
+  }
+
   async updateImageGenerationModelConfig(primary: string | null, fallbacks: string[]): Promise<boolean> {
     const config = this.readConfigFile();
     if (!config) return false;
@@ -1638,7 +1855,9 @@ export class AgentProvisioner {
     workspaceDir: string,
     model?: string,
     fallbackMode: AgentFallbackMode = 'inherit',
-    fallbacks: string[] = []
+    fallbacks: string[] = [],
+    systemPromptMode: AgentSystemPromptMode = 'system',
+    toolMode: AgentToolMode = 'full',
   ): boolean {
     const config = this.readConfigFile();
     if (!config) return false;
@@ -1662,7 +1881,32 @@ export class AgentProvisioner {
       this.buildStoredModelValue(normalizedModel, fallbackMode, normalizedFallbacks)
     );
 
-    if (!changed && !modelChanged) {
+    const runtimeChanged = (() => {
+      const previousSerialized = JSON.stringify({
+        systemPromptOverride: entry.systemPromptOverride,
+        tools: entry.tools,
+      });
+      const nextSystemPromptMode = this.normalizeSystemPromptMode(systemPromptMode);
+      if (nextSystemPromptMode === 'agent') {
+        entry.systemPromptOverride = this.buildAgentSystemPromptOverride(agentId);
+      } else {
+        delete entry.systemPromptOverride;
+      }
+
+      const nextToolMode = this.normalizeToolMode(toolMode);
+      if (nextToolMode === 'off') {
+        entry.tools = { deny: ['*'] };
+      } else {
+        entry.tools = { profile: nextToolMode };
+      }
+
+      return previousSerialized !== JSON.stringify({
+        systemPromptOverride: entry.systemPromptOverride,
+        tools: entry.tools,
+      });
+    })();
+
+    if (!changed && !modelChanged && !runtimeChanged) {
       return false;
     }
 
