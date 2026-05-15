@@ -4,10 +4,12 @@ set -e
 # Configuration
 PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SERVICE_DIR="$HOME/.config/systemd/user"
+LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 SKIP_SERVICE_RESTART=${CLAWUI_SKIP_SERVICE_RESTART:-0}
 BROWSER_WARMUP_MARKER="$HOME/${CLAWUI_DATA_DIR:-.clawui}/browser-warmup.pending"
+OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 
-export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 emit_phase() {
     echo "::clawui-update-phase::$1"
@@ -17,26 +19,190 @@ restore_deploy_lockfiles() {
     git restore -- package-lock.json backend/package-lock.json frontend/package-lock.json 2>/dev/null || true
 }
 
-require_linux_systemd_host() {
-    local os_name
-    os_name="$(uname -s 2>/dev/null || echo unknown)"
-    if [ "$os_name" != "Linux" ]; then
-        echo "Error: current OS is $os_name."
-        echo "OpenClaw Chat Gateway deployment currently supports only native Linux hosts with OpenClaw installed."
-        echo "macOS does not provide systemd, so this script cannot install the background service."
-        exit 1
+require_supported_host() {
+    case "$OS_NAME" in
+        Linux)
+            if ! command -v systemctl >/dev/null 2>&1; then
+                echo "Error: systemctl was not found. Please deploy on a Linux host with user-level systemd."
+                exit 1
+            fi
+            ;;
+        Darwin)
+            if ! command -v launchctl >/dev/null 2>&1; then
+                echo "Error: launchctl was not found. Please deploy from a normal macOS user session."
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Error: current OS is $OS_NAME."
+            echo "OpenClaw Chat Gateway deployment currently supports Linux(systemd) and macOS(launchd)."
+            exit 1
+            ;;
+    esac
+}
+
+get_node_path() {
+    command -v node
+}
+
+get_local_ip() {
+    if [ "$OS_NAME" = "Linux" ] && command -v hostname >/dev/null 2>&1 && hostname -I >/dev/null 2>&1; then
+        hostname -I | awk '{print $1}'
+        return
     fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo "Error: systemctl was not found. Please deploy on a Linux host with user-level systemd."
-        exit 1
+    if [ "$OS_NAME" = "Darwin" ] && command -v ipconfig >/dev/null 2>&1; then
+        ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || true
+        return
+    fi
+    echo ""
+}
+
+plist_escape() {
+    printf '%s' "$1" \
+        | sed -e 's/&/\&amp;/g' \
+              -e 's/</\&lt;/g' \
+              -e 's/>/\&gt;/g' \
+              -e 's/"/\&quot;/g' \
+              -e "s/'/\&apos;/g"
+}
+
+setup_linux_systemd_service() {
+    emit_phase "setup-service"
+    echo "Setting up systemd service..."
+    mkdir -p "$SERVICE_DIR"
+
+    if [ "$CLAWUI_PORT" == "3115" ] && [ -f "$SERVICE_DIR/clawui.service" ]; then
+        echo "Transitioning from legacy clawui.service to $SERVICE_NAME.service..."
+        systemctl --user stop clawui.service 2>/dev/null || true
+        systemctl --user disable clawui.service 2>/dev/null || true
+        rm -f "$SERVICE_DIR/clawui.service"
+    fi
+
+    cp "$PROJECT_ROOT/clawui.service" "$SERVICE_DIR/$SERVICE_NAME.service"
+    sed -i "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/backend|" "$SERVICE_DIR/$SERVICE_NAME.service"
+    sed -i "s/Environment=PORT=.*/Environment=PORT=$CLAWUI_PORT/" "$SERVICE_DIR/$SERVICE_NAME.service"
+    sed -i "s/Description=.*/Description=ClawUI Service (Port $CLAWUI_PORT)/" "$SERVICE_DIR/$SERVICE_NAME.service"
+    if grep -q '^Environment=PATH=' "$SERVICE_DIR/$SERVICE_NAME.service"; then
+        sed -i "s|^Environment=PATH=.*|Environment=PATH=$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin|" "$SERVICE_DIR/$SERVICE_NAME.service"
+    else
+        sed -i "/Environment=NODE_ENV=.*/a Environment=PATH=$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$SERVICE_DIR/$SERVICE_NAME.service"
+    fi
+
+    echo "Reloading systemd daemon..."
+    systemctl --user daemon-reload
+
+    echo "Enabling service $SERVICE_NAME..."
+    systemctl --user enable "$SERVICE_NAME.service"
+
+    if [ "$SKIP_SERVICE_RESTART" = "1" ]; then
+        echo "Skipping service restart because CLAWUI_SKIP_SERVICE_RESTART=1"
+    else
+        restart_openclaw_gateway
+        emit_phase "service-restart"
+        echo "Restarting service $SERVICE_NAME..."
+        mkdir -p "$(dirname "$BROWSER_WARMUP_MARKER")"
+        touch "$BROWSER_WARMUP_MARKER"
+        systemctl --user restart "$SERVICE_NAME.service"
+    fi
+
+    echo "Enabling lingering for user $(whoami)..."
+    if command -v loginctl >/dev/null 2>&1; then
+        sudo -n loginctl enable-linger $(whoami) || echo "Warning: Could not enable lingering. Manual action may be required: sudo loginctl enable-linger $(whoami)"
+    fi
+
+    STATUS_HINT="systemctl --user status $SERVICE_NAME"
+}
+
+setup_macos_launchd_service() {
+    emit_phase "setup-service"
+    echo "Setting up macOS launchd service..."
+    mkdir -p "$LAUNCH_AGENT_DIR"
+    mkdir -p "$HOME/Library/Logs/OpenClaw-Chat-Gateway"
+
+    local node_path plist_path label escaped_project_root escaped_node_path escaped_home escaped_path
+    node_path="$(get_node_path)"
+    label="cc.angeworld.clawui.$CLAWUI_PORT"
+    plist_path="$LAUNCH_AGENT_DIR/$label.plist"
+    escaped_project_root="$(plist_escape "$PROJECT_ROOT")"
+    escaped_node_path="$(plist_escape "$node_path")"
+    escaped_home="$(plist_escape "$HOME")"
+    escaped_path="$(plist_escape "$PATH")"
+
+    if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+        echo "Stopping existing launchd service $label..."
+        launchctl bootout "gui/$(id -u)" "$plist_path" 2>/dev/null || true
+    fi
+
+    cat > "$plist_path" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$escaped_node_path</string>
+        <string>dist/index.js</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$escaped_project_root/backend</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PORT</key>
+        <string>$CLAWUI_PORT</string>
+        <key>NODE_ENV</key>
+        <string>production</string>
+        <key>CLAWUI_DATA_DIR</key>
+        <string>.clawui_release</string>
+        <key>HOME</key>
+        <string>$escaped_home</string>
+        <key>PATH</key>
+        <string>$escaped_path</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$escaped_home/Library/Logs/OpenClaw-Chat-Gateway/clawui-$CLAWUI_PORT.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$escaped_home/Library/Logs/OpenClaw-Chat-Gateway/clawui-$CLAWUI_PORT.err.log</string>
+</dict>
+</plist>
+EOF
+
+    if [ "$SKIP_SERVICE_RESTART" = "1" ]; then
+        echo "Skipping service restart because CLAWUI_SKIP_SERVICE_RESTART=1"
+    else
+        restart_openclaw_gateway
+        emit_phase "service-restart"
+        echo "Starting launchd service $label..."
+        mkdir -p "$(dirname "$BROWSER_WARMUP_MARKER")"
+        touch "$BROWSER_WARMUP_MARKER"
+        launchctl bootstrap "gui/$(id -u)" "$plist_path"
+        launchctl kickstart -k "gui/$(id -u)/$label" || true
+    fi
+
+    STATUS_HINT="launchctl print gui/$(id -u)/$label"
+}
+
+restart_openclaw_gateway() {
+    emit_phase "restart-openclaw-runtime"
+    echo "Restarting OpenClaw gateway..."
+    if command -v openclaw >/dev/null 2>&1; then
+        openclaw gateway restart --json || openclaw gateway restart || echo "Warning: Failed to restart OpenClaw gateway automatically."
+    else
+        echo "Warning: openclaw command not found in PATH; skipped gateway restart."
     fi
 }
 
 # Default Port
 CLAWUI_PORT=${1:-3115}
 SERVICE_NAME="clawui-${CLAWUI_PORT}"
+STATUS_HINT=""
 
-require_linux_systemd_host
+require_supported_host
 
 # Build steps need devDependencies even when the service environment sets NODE_ENV=production.
 export NPM_CONFIG_PRODUCTION=false
@@ -48,6 +214,7 @@ emit_phase "install-dependencies"
 echo "Deploying OpenClaw Chat Gateway (Consolidated)..."
 echo "Project Path:  $PROJECT_ROOT"
 echo "Service Port:  $CLAWUI_PORT"
+echo "Host OS:       $OS_NAME"
 echo "Service Name:  $SERVICE_NAME"
 
 echo "Installing dependencies..."
@@ -65,63 +232,16 @@ emit_phase "patch-config"
 echo "Patching OpenClaw configuration for local backend connections..."
 node backend/patch-config.js || echo "Warning: Failed to patch OpenClaw config automatically."
 
-emit_phase "setup-service"
-echo "Setting up systemd service..."
-mkdir -p "$SERVICE_DIR"
+case "$OS_NAME" in
+    Linux)
+        setup_linux_systemd_service
+        ;;
+    Darwin)
+        setup_macos_launchd_service
+        ;;
+esac
 
-# Clean up old services if they exist (legacy single service name)
-if [ "$CLAWUI_PORT" == "3115" ] && [ -f "$SERVICE_DIR/clawui.service" ]; then
-    echo "Transitioning from legacy clawui.service to $SERVICE_NAME.service..."
-    systemctl --user stop clawui.service 2>/dev/null || true
-    systemctl --user disable clawui.service 2>/dev/null || true
-    rm -f "$SERVICE_DIR/clawui.service"
-fi
-
-# Copy and update the consolidated service file
-cp "$PROJECT_ROOT/clawui.service" "$SERVICE_DIR/$SERVICE_NAME.service"
-
-# Update WorkingDirectory, Port, and Description in the service file
-sed -i "s|WorkingDirectory=.*|WorkingDirectory=$PROJECT_ROOT/backend|" "$SERVICE_DIR/$SERVICE_NAME.service"
-sed -i "s/Environment=PORT=.*/Environment=PORT=$CLAWUI_PORT/" "$SERVICE_DIR/$SERVICE_NAME.service"
-sed -i "s/Description=.*/Description=ClawUI Service (Port $CLAWUI_PORT)/" "$SERVICE_DIR/$SERVICE_NAME.service"
-if grep -q '^Environment=PATH=' "$SERVICE_DIR/$SERVICE_NAME.service"; then
-    sed -i "s|^Environment=PATH=.*|Environment=PATH=$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin|" "$SERVICE_DIR/$SERVICE_NAME.service"
-else
-    sed -i "/Environment=NODE_ENV=.*/a Environment=PATH=$HOME/.npm-global/bin:$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" "$SERVICE_DIR/$SERVICE_NAME.service"
-fi
-
-echo "Reloading systemd daemon..."
-systemctl --user daemon-reload
-
-echo "Enabling service $SERVICE_NAME..."
-systemctl --user enable "$SERVICE_NAME.service"
-
-if [ "$SKIP_SERVICE_RESTART" = "1" ]; then
-    echo "Skipping service restart because CLAWUI_SKIP_SERVICE_RESTART=1"
-else
-    emit_phase "restart-openclaw-runtime"
-    echo "Restarting OpenClaw gateway..."
-    if command -v openclaw >/dev/null 2>&1; then
-        openclaw gateway restart --json || openclaw gateway restart || echo "Warning: Failed to restart OpenClaw gateway automatically."
-    else
-        echo "Warning: openclaw command not found in PATH; skipped gateway restart."
-    fi
-
-    emit_phase "service-restart"
-    echo "Restarting service $SERVICE_NAME..."
-    mkdir -p "$(dirname "$BROWSER_WARMUP_MARKER")"
-    touch "$BROWSER_WARMUP_MARKER"
-    systemctl --user restart "$SERVICE_NAME.service"
-fi
-
-# Ensure services stay running after logout
-echo "Enabling lingering for user $(whoami)..."
-if command -v loginctl >/dev/null 2>&1; then
-    sudo -n loginctl enable-linger $(whoami) || echo "Warning: Could not enable lingering. Manual action may be required: sudo loginctl enable-linger $(whoami)"
-fi
-
-# Get local IP address
-LOCAL_IP=$(hostname -I | awk '{print $1}')
+LOCAL_IP=$(get_local_ip)
 [ -z "$LOCAL_IP" ] && LOCAL_IP="localhost"
 
 echo "------------------------------------------------"
@@ -129,4 +249,4 @@ echo "Deployment complete!"
 echo "Local Access:   http://localhost:$CLAWUI_PORT"
 echo "Network Access: http://$LOCAL_IP:$CLAWUI_PORT"
 echo "------------------------------------------------"
-echo "Check status with: systemctl --user status $SERVICE_NAME"
+echo "Check status with: $STATUS_HINT"
