@@ -4,27 +4,59 @@ set -e
 # Configuration
 # If not in a project dir, default to ~/OpenClaw-Chat-Gateway
 INSTALL_DIR="$HOME/OpenClaw-Chat-Gateway"
+OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 
 emit_phase() {
     echo "::clawui-update-phase::$1"
 }
 
-require_linux_systemd_host() {
-    local os_name
-    os_name="$(uname -s 2>/dev/null || echo unknown)"
-    if [ "$os_name" != "Linux" ]; then
-        echo "Error: current OS is $os_name."
-        echo "OpenClaw Chat Gateway update currently supports only native Linux hosts with OpenClaw installed."
-        echo "macOS does not provide systemd, so this script cannot upgrade the background service."
-        exit 1
-    fi
-    if ! command -v systemctl >/dev/null 2>&1; then
-        echo "Error: systemctl was not found. Please update on a Linux host with user-level systemd."
-        exit 1
-    fi
+require_supported_host() {
+    case "$OS_NAME" in
+        Linux)
+            if ! command -v systemctl >/dev/null 2>&1; then
+                echo "Error: systemctl was not found. Please update on a Linux host with user-level systemd."
+                exit 1
+            fi
+            ;;
+        Darwin)
+            if ! command -v launchctl >/dev/null 2>&1; then
+                echo "Error: launchctl was not found. Please update from a normal macOS user session."
+                exit 1
+            fi
+            ;;
+        *)
+            echo "Error: current OS is $OS_NAME."
+            echo "OpenClaw Chat Gateway update currently supports Linux(systemd) and macOS(launchd)."
+            exit 1
+            ;;
+    esac
 }
 
-require_linux_systemd_host
+detect_existing_port() {
+    local existing_port=""
+    if [ "$OS_NAME" = "Linux" ]; then
+        local service_dir="$HOME/.config/systemd/user"
+        local services first_service
+        services=$(ls $service_dir/clawui-*.service 2>/dev/null | sort -V || true)
+        if [ -n "$services" ]; then
+            first_service=$(echo "$services" | head -n 1)
+            existing_port=$(basename "$first_service" | sed 's/clawui-\([0-9]*\)\.service/\1/')
+        elif [ -f "$service_dir/clawui.service" ]; then
+            existing_port="3115"
+        fi
+    elif [ "$OS_NAME" = "Darwin" ]; then
+        local launch_agent_dir="$HOME/Library/LaunchAgents"
+        local plists first_plist
+        plists=$(ls $launch_agent_dir/cc.angeworld.clawui.*.plist 2>/dev/null | sort -V || true)
+        if [ -n "$plists" ]; then
+            first_plist=$(echo "$plists" | head -n 1)
+            existing_port=$(basename "$first_plist" | sed 's/cc\.angeworld\.clawui\.\([0-9]*\)\.plist/\1/')
+        fi
+    fi
+    echo "$existing_port"
+}
+
+require_supported_host
 
 if [ -f "deploy-release.sh" ]; then
     PROJECT_ROOT="$(pwd)"
@@ -36,30 +68,15 @@ else
     exit 1
 fi
 
-SERVICE_DIR="$HOME/.config/systemd/user"
-
 echo "================================================"
 echo "   OpenClaw Chat Gateway - 更新脚本"
 echo "================================================"
 
-# 1. 从服务文件中探测现有端口
 emit_phase "detect-service"
-EXISTING_PORT=""
-SERVICES=$(ls $SERVICE_DIR/clawui-*.service 2>/dev/null | sort -V || true)
-
-if [ -n "$SERVICES" ]; then
-    # 使用找到的第一个服务端口作为默认值
-    FIRST_SERVICE=$(echo "$SERVICES" | head -n 1)
-    EXISTING_PORT=$(basename "$FIRST_SERVICE" | sed 's/clawui-\([0-9]*\)\.service/\1/')
+EXISTING_PORT="$(detect_existing_port)"
+if [ -n "$EXISTING_PORT" ]; then
     echo "检测到正在运行的端口: $EXISTING_PORT"
-else
-    # 检查旧版服务文件
-    if [ -f "$SERVICE_DIR/clawui.service" ]; then
-        EXISTING_PORT="3115"
-        echo "检测到旧版安装 (端口 3115)"
-    fi
 fi
-
 TARGET_PORT=${1:-$EXISTING_PORT}
 TARGET_PORT=${TARGET_PORT:-3115}
 
