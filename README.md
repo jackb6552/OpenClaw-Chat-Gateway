@@ -44,28 +44,28 @@
 
 ### 🚀 快速开始
 > [!IMPORTANT]
-> 本项目须安装在安装了 OpenClaw 的 **Linux 主机**上，且必须是 **原生安装**（非 Docker）。
+> 本项目须安装在已安装 OpenClaw 的主机上。当前 fork 的一键部署支持 **Linux(systemd)** 和 **macOS(launchd)**。macOS 支持依赖 OpenClaw 本体在 macOS 上可正常运行。
 
 #### 📥 一键安装
 
 **默认端口 3115**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/install.sh | bash
 ```
 
 **自定义端口部署 (例如 8080)**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
 ```
 
 #### 🆙 无损升级
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/update.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/update.sh | bash
 ```
 
 #### 🗑️ 彻底卸载
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/uninstall.sh | bash
 ```
 
 ---
@@ -81,9 +81,13 @@ curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/ma
 ---
 
 ### 💡 提示：预览增强
-如果您需要预览 Word, PPT, Excel 等文档，请运行以下指令安装 LibreOffice：
+如果您需要预览 Word, PPT, Excel 等文档，请安装 LibreOffice：
 ```bash
+# Linux
 sudo apt update && sudo apt install libreoffice -y
+
+# macOS
+brew install --cask libreoffice
 ```
 
 ### 💬 社群与支持
@@ -127,28 +131,28 @@ sudo apt update && sudo apt install libreoffice -y
 
 ### 🚀 Quick Start
 > [!IMPORTANT]
-> This project must be installed on a **Linux host** where OpenClaw is already installed, and it must be a **native installation** (not Docker).
+> This project must be installed on a host where OpenClaw is already installed. This fork's one-click deployment supports **Linux(systemd)** and **macOS(launchd)**. macOS support requires OpenClaw itself to work correctly on macOS.
 
 #### 📥 One-Click Installation
 
 **Default port 3115**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/install.sh | bash
 ```
 
 **Custom port deployment (e.g., 8080)**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/install.sh | bash -s 8080
 ```
 
 #### 🆙 Non-Destructive Upgrade
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/update.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/update.sh | bash
 ```
 
 #### 🗑️ Complete Uninstallation
 ```bash
-curl -fsSL https://raw.githubusercontent.com/liandu2024/OpenClaw-Chat-Gateway/main/uninstall.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jackb6552/OpenClaw-Chat-Gateway/main/uninstall.sh | bash
 ```
 
 ---
@@ -164,9 +168,13 @@ Meticulously crafted mobile details, providing not just responsiveness, but imme
 ---
 
 ### 💡 Tip: Enhanced Preview
-If you need to preview documents like Word, PPT, or Excel, please run the following command to install LibreOffice:
+If you need to preview documents like Word, PPT, or Excel, install LibreOffice:
 ```bash
+# Linux
 sudo apt update && sudo apt install libreoffice -y
+
+# macOS
+brew install --cask libreoffice
 ```
 
 ### 💬 Community & Support
