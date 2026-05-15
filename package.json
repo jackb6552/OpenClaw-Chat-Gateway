@@ -6,9 +6,9 @@
   "private": true,
   "repository": {
     "type": "git",
-    "url": "https://github.com/liandu2024/OpenClaw-Chat-Gateway.git"
+    "url": "https://github.com/jackb6552/OpenClaw-Chat-Gateway.git"
   },
-  "homepage": "https://github.com/liandu2024/OpenClaw-Chat-Gateway",
+  "homepage": "https://github.com/jackb6552/OpenClaw-Chat-Gateway",
   "scripts": {
     "dev": "export BACKEND_PORT=3100 FRONTEND_PORT=3105 CLAWUI_DATA_DIR=.clawui_dev && concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
     "release": "export BACKEND_PORT=3110 FRONTEND_PORT=3115 CLAWUI_DATA_DIR=.clawui_release && npm run build && concurrently \"npm run start:backend\" \"npm run start:frontend\"",
